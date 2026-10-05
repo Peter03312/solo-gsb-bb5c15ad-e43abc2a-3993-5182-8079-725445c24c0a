@@ -1,0 +1,377 @@
+"""FastAPI application: HTTP API for dataset derivative permission checks."""
+
+from __future__ import annotations
+
+import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from typing import Any
+
+from fastapi import FastAPI, Query, Request
+from fastapi.responses import JSONResponse
+
+from .config import Settings, settings as default_settings
+from .database import Database
+from .schemas import (
+    BasisEntry,
+    BlockerEntry,
+    ChangeRevocationRequest,
+    CreateResponse,
+    ErrorDetail,
+    ImpactedVersion,
+    LicenseChangeRequest,
+    LicenseChangeResponse,
+    PermissionResponse,
+    PermissionSegment,
+    PermissionTimelineResponse,
+    PreviewChangeRequest,
+    PreviewChangeStub,
+    PreviewQuery,
+    PreviewResponse,
+    RevocationReceipt,
+    RevocationResponse,
+    VersionCreateRequest,
+    VersionResponse,
+    VoucherDecision,
+    VoucherIssueRequest,
+    VoucherResponse,
+)
+from .seed import seed_demo_data
+from .service import InvalidTimeError, LicenseService, ServiceError
+
+logger = logging.getLogger("license_service")
+
+
+def _parse_aware_param(raw: str, name: str) -> datetime:
+    """Parse an ISO 8601 query parameter that must carry a timezone."""
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise InvalidTimeError(
+            f"{name} 参数必须是带时区的 ISO 8601 时刻，例如 2026-07-01T00:00:00Z"
+        ) from exc
+    if parsed.tzinfo is None:
+        raise InvalidTimeError(f"{name} 参数必须带时区信息（例如结尾的 Z 或 +00:00）")
+    return parsed
+
+
+class AppState:
+    def __init__(self, db: Database, service: LicenseService) -> None:
+        self.db = db
+        self.service = service
+
+
+def create_app(settings: Settings | None = None) -> FastAPI:
+    settings = settings or default_settings
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> Any:
+        db = Database(settings.db_path)
+        if settings.init_db:
+            db.init_schema()
+            logger.info("数据库 schema 已就绪：%s", settings.db_path)
+        if settings.seed_demo and settings.init_db:
+            seed_demo_data(db)
+        if settings.echo:
+            logger.info(
+                "配置 DB_PATH=%s HOST=%s PORT=%s INIT_DB=%s SEED_DEMO=%s",
+                settings.db_path,
+                settings.host,
+                settings.port,
+                settings.init_db,
+                settings.seed_demo,
+            )
+        app.state.app_state = AppState(db, LicenseService(db))
+        try:
+            yield
+        finally:
+            db.close()
+
+    app = FastAPI(
+        title="数据集派生许可判定服务",
+        version="1.0.0",
+        description=(
+            "登记数据集版本与其固定父版本引用、登记按 UTC 时刻生效的允许用途变更，"
+            "并基于自身及全部祖先的最近一次有效变更的用途交集判定可否使用。"
+        ),
+        lifespan=lifespan,
+    )
+
+    def service_from(request: Request) -> LicenseService:
+        return request.app.state.app_state.service  # type: ignore[no-any-return]
+
+    # -- error handling ---------------------------------------------------
+
+    @app.exception_handler(ServiceError)
+    async def handle_service_error(_: Request, exc: ServiceError) -> JSONResponse:
+        detail = ErrorDetail(error=exc.code, message=exc.message, details=exc.details)
+        return JSONResponse(status_code=exc.status_code, content=detail.model_dump())
+
+    @app.exception_handler(ValueError)
+    async def handle_value_error(_: Request, exc: ValueError) -> JSONResponse:
+        detail = ErrorDetail(
+            error="invalid_time",
+            message="无法解析带时区的 UTC 时刻：" + str(exc),
+        )
+        return JSONResponse(status_code=422, content=detail.model_dump())
+
+    # -- health & meta ----------------------------------------------------
+
+    @app.get("/health", tags=["meta"], summary="健康检查")
+    def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    # -- versions ---------------------------------------------------------
+
+    @app.post(
+        "/versions",
+        response_model=CreateResponse,
+        status_code=201,
+        tags=["versions"],
+        summary="登记数据集版本并固定父版本引用（不可修改）",
+    )
+    def create_version(payload: VersionCreateRequest, request: Request) -> CreateResponse:
+        version = service_from(request).register_version(
+            version_id=payload.version_id,
+            parent_ids=payload.parent_ids,
+            note=payload.note,
+        )
+        return CreateResponse(replayed=False, version=VersionResponse(**version))
+
+    @app.get(
+        "/versions",
+        response_model=list[VersionResponse],
+        tags=["versions"],
+        summary="列出所有版本",
+    )
+    def list_versions(request: Request) -> list[VersionResponse]:
+        return [VersionResponse(**v) for v in service_from(request).list_versions()]
+
+    @app.get(
+        "/versions/{version_id}",
+        response_model=VersionResponse,
+        tags=["versions"],
+        summary="查询版本详情（含父版本与许可变更）",
+    )
+    def get_version(version_id: str, request: Request) -> VersionResponse:
+        return VersionResponse(**service_from(request).get_version(version_id))
+
+    # -- license changes --------------------------------------------------
+
+    @app.post(
+        "/license-changes",
+        response_model=CreateResponse,
+        status_code=201,
+        tags=["license-changes"],
+        summary="登记按 UTC 时刻生效的允许用途变更（幂等）",
+        responses={
+            200: {"description": "相同标识与内容的重复提交，返回已存在结果"},
+            201: {"description": "新变更已创建"},
+            409: {"description": "标识相同内容不同，或同版本同时刻存在不同变更"},
+        },
+    )
+    def create_change(
+        payload: LicenseChangeRequest, request: Request
+    ) -> JSONResponse | CreateResponse:
+        change, replayed = service_from(request).submit_change(
+            change_id=payload.change_id,
+            version_id=payload.version_id,
+            effective_at=payload.effective_at,
+            allowed_uses=payload.allowed_uses,
+        )
+        body = CreateResponse(replayed=replayed, change=LicenseChangeResponse(**change))
+        if replayed:
+            # 200 OK makes idempotent replays distinguishable from creation.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/license-changes/{change_id}",
+        response_model=LicenseChangeResponse,
+        tags=["license-changes"],
+        summary="按标识查询许可变更",
+    )
+    def get_change(change_id: str, request: Request) -> LicenseChangeResponse:
+        return LicenseChangeResponse(**service_from(request).get_change(change_id))
+
+    @app.post(
+        "/license-changes/preview",
+        response_model=PreviewResponse,
+        tags=["license-changes"],
+        summary="预演许可变更对目标版本及全部后代的影响（不写入变更）",
+        responses={
+            200: {"description": "预演完成，返回允许状态发生变化的版本及前后判定"},
+            404: {"description": "目标版本不存在"},
+            409: {"description": "变更标识冲突，或同版本同生效时刻存在不同变更"},
+            422: {"description": "生效/查询时刻缺少时区或无法解析，或参数非法"},
+        },
+    )
+    def preview_change(
+        payload: PreviewChangeRequest, request: Request
+    ) -> PreviewResponse:
+        result = service_from(request).preview_change(
+            change_id=payload.change_id,
+            version_id=payload.version_id,
+            effective_at=payload.effective_at,
+            allowed_uses=payload.allowed_uses,
+            use=payload.use,
+            at=payload.at,
+        )
+        return PreviewResponse(
+            replayed=result["replayed"],
+            change=PreviewChangeStub(**result["change"]),
+            query=PreviewQuery(**result["query"]),
+            scope=result["scope"],
+            impacted_versions=[
+                ImpactedVersion(**entry) for entry in result["impacted_versions"]
+            ],
+        )
+
+    @app.post(
+        "/license-changes/revocations",
+        response_model=RevocationResponse,
+        status_code=201,
+        tags=["license-changes"],
+        summary="作废一条已登记的许可变更（幂等）",
+        responses={
+            200: {"description": "同一作废标识与内容重试，返回原回执"},
+            201: {"description": "作废已登记，返回回执"},
+            404: {"description": "目标许可变更不存在"},
+            409: {"description": "作废标识复用指向不同内容，或该变更已被另一标识作废"},
+        },
+    )
+    def revoke_change(
+        payload: ChangeRevocationRequest, request: Request
+    ) -> JSONResponse | RevocationResponse:
+        receipt, replayed = service_from(request).revoke_change(
+            change_id=payload.change_id,
+            revocation_id=payload.revocation_id,
+            reason=payload.reason,
+        )
+        body = RevocationResponse(
+            replayed=replayed, receipt=RevocationReceipt(**receipt)
+        )
+        if replayed:
+            # 200 OK distinguishes an idempotent retry from a first-time void.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/license-changes/revocations/{revocation_id}",
+        response_model=RevocationReceipt,
+        tags=["license-changes"],
+        summary="按作废标识追溯作废回执",
+        responses={404: {"description": "作废回执不存在"}},
+    )
+    def get_revocation(revocation_id: str, request: Request) -> RevocationReceipt:
+        return RevocationReceipt(**service_from(request).get_revocation(revocation_id))
+
+    # -- permission check -------------------------------------------------
+
+    @app.get(
+        "/permissions/check",
+        response_model=PermissionResponse,
+        tags=["permissions"],
+        summary="判定给定版本在某 UTC 时刻是否可用于某用途",
+        responses={422: {"description": "时刻缺少时区或无法解析"}},
+    )
+    def check_permission(
+        request: Request,
+        version_id: str = Query(..., description="被查询的数据集版本"),
+        use: str = Query(..., description="拟使用的用途"),
+        at: str = Query(..., alias="at", description="UTC 时刻（带时区），如 2026-07-01T00:00:00Z"),
+    ) -> PermissionResponse:
+        parsed = _parse_aware_param(at, "at")
+        result = service_from(request).check_permission(version_id, use, parsed)
+        return PermissionResponse(
+            version_id=result["version_id"],
+            use=result["use"],
+            at=result["at"],
+            allowed=result["allowed"],
+            closure=result["closure"],
+            basis=[BasisEntry(**b) for b in result["basis"]],
+            blockers=[BlockerEntry(**b) for b in result["blockers"]],
+            allowed_uses_intersection=result["allowed_uses_intersection"],
+        )
+
+    @app.get(
+        "/permissions/timeline",
+        response_model=PermissionTimelineResponse,
+        tags=["permissions"],
+        summary="把半开区间 [start, end) 切成连续、无重叠的许可判定片段",
+        responses={
+            404: {"description": "版本不存在"},
+            422: {"description": "起止时刻缺少时区或无法解析，或区间为空/倒置"},
+        },
+    )
+    def permission_timeline(
+        request: Request,
+        version_id: str = Query(..., description="被查询的数据集版本"),
+        use: str = Query(..., description="拟使用的用途"),
+        start: str = Query(..., description="区间开始时刻（带时区，含），如 2026-01-15T00:00:00Z"),
+        end: str = Query(..., description="区间结束时刻（带时区，不含），如 2026-07-15T00:00:00Z"),
+    ) -> PermissionTimelineResponse:
+        start_dt = _parse_aware_param(start, "start")
+        end_dt = _parse_aware_param(end, "end")
+        result = service_from(request).check_permission_timeline(
+            version_id, use, start_dt, end_dt
+        )
+        return PermissionTimelineResponse(
+            version_id=result["version_id"],
+            use=result["use"],
+            start=result["start"],
+            end=result["end"],
+            closure=result["closure"],
+            segments=[PermissionSegment(**segment) for segment in result["segments"]],
+        )
+
+    @app.post(
+        "/permissions/vouchers",
+        response_model=VoucherResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="把一次用途判定作为可追溯凭证原子签发并持久保存",
+        responses={
+            200: {"description": "同标识与同输入重试，返回首次保存的原凭证"},
+            201: {"description": "首次签发：判定与保存已原子完成，返回凭证"},
+            404: {"description": "版本不存在"},
+            409: {"description": "凭证标识复用到不同输入"},
+            422: {"description": "判定时刻缺少时区或无法解析，或用途为空白"},
+        },
+    )
+    def issue_voucher(
+        payload: VoucherIssueRequest, request: Request
+    ) -> JSONResponse | VoucherResponse:
+        voucher, replayed = service_from(request).issue_voucher(
+            voucher_id=payload.voucher_id,
+            version_id=payload.version_id,
+            use=payload.use,
+            at=payload.at,
+        )
+        body = VoucherResponse(
+            replayed=replayed, voucher=VoucherDecision(**voucher)
+        )
+        if replayed:
+            # 200 OK distinguishes an idempotent retry from first-time issuing.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/vouchers/{voucher_id}",
+        response_model=VoucherDecision,
+        tags=["permissions"],
+        summary="按凭证标识查询首次保存的判定凭证（历史不可改写）",
+        responses={404: {"description": "凭证不存在"}},
+    )
+    def get_voucher(voucher_id: str, request: Request) -> VoucherDecision:
+        return VoucherDecision(**service_from(request).get_voucher(voucher_id))
+
+    return app
+
+
+app = create_app()

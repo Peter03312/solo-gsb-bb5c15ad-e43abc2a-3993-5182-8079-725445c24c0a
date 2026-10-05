@@ -1,0 +1,455 @@
+# 数据集派生许可判定服务
+
+为研究团队提供「数据集派生许可」的登记与判定能力。基于 **Python 3.11 + FastAPI + SQLite**，单容器即可运行，数据持久化在 Docker Volume 中。
+
+## 判定规则
+
+- **版本登记**：登记一个数据集版本时，可固定引用多个**已经存在**的父版本；父版本引用在创建之后不可修改（服务不提供任何修改/删除父引用的接口，重复登记同一版本号返回 `409`）。父引用构成一个不可变的 DAG。
+- **许可变更**：可对任一已登记版本提交许可变更，记录其 **按 UTC 时刻生效** 的允许用途全集（后一次变更整体覆盖前一次，不做用途增量合并）。
+- **判定口径**：查询「给定版本 + 用途 + UTC 时刻」时——
+  1. 取该版本**自身及全部祖先**（沿固定父引用展开、自动去重，支持菱形继承）；
+  2. 对其中每个版本，取**不晚于查询时刻的最近一次**许可变更作为该版本当时的有效许可；
+  3. 对各版本的允许用途取**交集**；
+  4. **任一版本在该时刻没有有效许可，或其有效许可不包含所申请用途，即拒绝**；
+  5. 响应返回：`allowed` 可否使用、`basis` 各版本所依据的变更、`blockers` 所有阻断版本（含原因）、`allowed_uses_intersection` 交集。
+- **区间分段判定（排期）**：查询「给定版本 + 用途 + 带时区的起止时刻（开始严格早于结束）」时，服务在**一次一致数据视图**中展开自身及全部祖先，把半开区间 **[start, end)** 切成连续、无重叠的片段：分段点取自闭包内各版本变更的生效时刻，**起点恰逢变更立即采用新许可、终点上的变更不计入**；无有效许可的时段持续拒绝；菱形祖先只算一次；**仅在判定依据或阻断信息变化时分段**，相邻相同片段自动合并。每段返回起止、`allowed`、`basis`、全部 `blockers`（含原因）与用途交集，任一参数非法（未知版本、无时区、区间倒置或为空）都明确报错且不返回部分结果。
+- **变更预演（不写入）**：提交变更前可经 `POST /license-changes/preview` 预演其对目标版本及全部后代的影响；同一数据快照下分别计算现状与假设提交后的判定，仅返回允许状态翻转的版本（含前后判定与阻断原因），菱形继承的后代只计一次；查询早于生效时刻、或已有更晚有效变更覆盖时结果为空且绝不误报；预演不写入任何数据，冲突/幂等语义与提交接口一致。
+- **许可变更作废**：业务人员发现变更登记有误时，可凭**原变更标识、唯一作废标识和原因**经 `POST /license-changes/revocations` 作废，返回含**原标识、作废标识、原因、登记时间**的回执（`registered_at` 由服务按 UTC 生成）。作废一经提交即对**所有查询时刻**生效：
+  - **原变更仍可按原接口查询**：`GET /license-changes/{change_id}` 与版本详情照常返回该变更，且附带作废回执（`revocation` 字段；未作废为 `null`）；回执也可经 `GET /license-changes/revocations/{revocation_id}` 追溯。
+  - **单时点判定**忽略已作废变更，改取该版本截至查询时刻最近的**未作废**变更；若没有，则按无有效许可（`no_valid_license`）阻断。
+  - **区间判定**仅以未作废变更划分片段，半开区间 `[start, end)` 口径与全部响应字段保持不变。
+  - **变更预演**基于同一份「作废后」快照计算（已作废变更不参与现状判定），且同样不落库。
+  - 原许可变更的**同标识重放**与**同版本同生效时刻冲突**规则不变；重放一条已作废变更只会返回原记录（仍标记为已作废），**不能恢复**它；与已作废变更同版本同生效时刻的新提交/预演仍报 `409`。
+- **用途判定凭证（可追溯）**：研究审批可把一次用途判定**固化为凭证**（`POST /permissions/vouchers`）。请求携带**唯一凭证标识、已登记版本、用途、带时区的判定时刻**；首次请求在**同一一致数据视图**中沿用现有判定规则，把服务按 UTC 生成的**登记时间**连同**完整祖先闭包、依据（basis）、阻断原因（blockers）与用途交集**一次性持久保存——**允许与拒绝都留痕**。判定与保存在**单个写事务内原子完成，失败不留半成品**。
+  - 凭证是**不可变历史**：`GET /permissions/vouchers/{voucher_id}` 始终返回**首次保存**的结果；之后的许可变更或作废只影响实时判定与预演，**不能改写历史凭证**。
+  - **幂等与冲突**：相同凭证标识、相同版本、**去首尾空格后相同的用途**、**换算为 UTC 后相同的判定时刻**重试 → `200` 且 `replayed=true`，返回原凭证；同一标识复用到不同输入（版本/用途/时刻任一不同）→ `409 conflict`；未知凭证 → `404 not_found`；未知版本 → `404`；空用途或无时区时刻 → `422`，且**均不留凭证**。
+- **幂等与冲突**：
+  - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
+  - 标识相同而内容不同 → `409 conflict`；
+  - 同一版本在同一生效时刻出现不同变更 → `409 conflict`；
+  - 作废接口：同一**作废标识**且内容（原变更、原因）完全相同的重试返回**原回执**（HTTP `200`，`replayed=true`）；复用同一作废标识指向不同内容（不同原变更或不同原因）→ `409`；以**另一作废标识重复作废同一变更** → `409`；目标变更不存在 → `404 not_found`；
+  - 所有时间必须**带时区**（如 `...Z`、`+08:00`），服务统一按 UTC 归一化；传入无时区时间返回 `422`。
+
+## 目录结构
+
+```
+.
+├── app/
+│   ├── main.py        # FastAPI 路由与异常映射
+│   ├── service.py     # 核心业务逻辑（登记 / 变更 / 判定 / 幂等冲突）
+│   ├── database.py    # SQLite 连接与建表
+│   ├── schemas.py     # 请求/响应模型
+│   ├── seed.py        # 幂等的示例数据
+│   └── config.py      # 环境变量配置
+├── tests/test_api.py  # 端到端测试（pytest + TestClient）
+├── docker/entrypoint.sh
+├── Dockerfile
+├── docker-compose.yml
+└── requirements.txt
+```
+
+## 快速开始（Docker Compose）
+
+前置：已安装 Docker 与 Compose 插件（`docker compose version` 可用）。
+
+```bash
+# 构建镜像、初始化依赖与数据库（首次启动自动建表并写入示例数据）并后台启动
+docker compose up -d --build
+
+# 查看日志
+docker compose logs -f
+
+# 停止
+docker compose down            # 保留数据卷
+docker compose down -v         # 同时删除数据卷（清空数据）
+```
+
+启动完成后（默认约 1–2 秒）：
+
+| 入口 | 地址 |
+| --- | --- |
+| 服务 Base URL | <http://localhost:8000> |
+| 健康检查 | <http://localhost:8000/health> |
+| Swagger UI（可在线调用） | <http://localhost:8000/docs> |
+| OpenAPI 文档 | <http://localhost:8000/openapi.json> |
+
+> 宿主机端口由环境变量 `APP_PORT` 控制（默认 `8000`），容器内固定监听 `8000`。数据存放在命名卷 `license-data`（容器内 `/data`）。
+
+## 配置项（环境变量）
+
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `APP_HOST` | `0.0.0.0` | uvicorn 监听地址，一般无需修改 |
+| `APP_PORT` | `8000` | **宿主机映射端口**（同时作为容器内监听端口）；改为如 `8080` 后访问 <http://localhost:8080> |
+| `DB_PATH` | `/data/licenses.db` | SQLite 数据库文件路径（位于持久化卷内） |
+| `INIT_DB` | `true` | 启动时自动建表（`CREATE TABLE IF NOT EXISTS`，幂等） |
+| `SEED_DEMO` | `true` | 数据库为空时写入示例数据；对已有数据的数据库自动跳过。生产环境可设为 `false` |
+| `CONFIG_ECHO` | `true` | 启动时在日志打印解析后的配置 |
+
+临时改端口或关闭示例数据：
+
+```bash
+APP_PORT=8080 SEED_DEMO=false docker compose up -d --build
+```
+
+## HTTP API
+
+### 1. 登记版本（固定父版本引用，不可修改）
+
+`POST /versions`
+
+```bash
+curl -X POST http://localhost:8000/versions \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "version_id": "dataset-c-v1",
+    "parent_ids": ["demo-root-a", "demo-root-b"],
+    "note": "由两个上游数据集派生"
+  }'
+```
+
+- `parent_ids` 中每个版本必须已存在，否则 `404`；
+- `version_id` / `change_id` 省略时服务自动生成 UUID；
+- 父引用创建后不可修改：再次提交相同 `version_id` 返回 `409`，且不存在任何编辑接口。
+
+### 2. 提交许可变更（幂等）
+
+`POST /license-changes`
+
+```bash
+curl -X POST http://localhost:8000/license-changes \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "change_id": "chg-c-1",
+    "version_id": "dataset-c-v1",
+    "effective_at": "2026-03-01T00:00:00Z",
+    "allowed_uses": ["research", "review"]
+  }'
+```
+
+- 首次创建返回 `201`；相同 `change_id` + 相同内容重放返回 `200` 且 `replayed=true`，`change` 内容与首次完全一致；
+- 同标识不同内容、或同版本同生效时刻的不同变更返回 `409`；
+- `allowed_uses` 是该时刻起允许用途的**全集**（覆盖语义）；用途去重、顺序无关。
+
+### 3. 判定可否使用
+
+`GET /permissions/check?version_id=...&use=...&at=...`
+
+```bash
+curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=research&at=2026-03-01T00:00:00Z"
+```
+
+允许时：
+
+```json
+{
+  "version_id": "demo-derived-1",
+  "use": "research",
+  "at": "2026-03-01T00:00:00Z",
+  "allowed": true,
+  "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+  "basis": [ { "version_id": "...", "change_id": "...", "effective_at": "...", "allowed_uses": ["..."] } ],
+  "blockers": [],
+  "allowed_uses_intersection": ["research"]
+}
+```
+
+拒绝时 `allowed=false`，`blockers` 列出**全部**阻断版本，`reason` 取值：
+
+- `no_valid_license`：该版本在查询时刻没有任何不晚于该时刻的变更（包括尚未登记任何变更、或所有变更都在未来生效）；
+- `use_not_allowed`：该版本的最近有效变更不包含所申请用途（同时回传所依据的 `change_id`、`effective_at` 与当时的 `allowed_uses`）。
+
+被祖先拒绝的示例：
+
+```bash
+# demo-root-a 在 2026-06-01 起仅允许 research，故 7 月对 demo-derived-1 申请 review 被阻断
+curl -s "http://localhost:8000/permissions/check?version_id=demo-derived-1&use=review&at=2026-07-01T00:00:00Z"
+# -> allowed=false, blockers 含 demo-root-a / use_not_allowed
+```
+
+### 4. 区间分段判定（本轮入口，排期用）
+
+`GET /permissions/timeline?version_id=...&use=...&start=...&end=...`
+
+回答「某用途在一段时期内**何时可用、为何中断**」：服务在一次一致数据视图中沿固定父引用展开自身及全部祖先（菱形去重），按各版本当时最近生效的许可变更与用途交集，把半开区间 **[start, end)** 切成连续、无重叠的片段。分段点只取自闭包内各版本变更的生效时刻；**仅在判定依据（basis）或阻断信息（blockers）变化时分段**，相邻相同片段自动合并。
+
+- 起点恰好有变更：立即采用新许可（与单时刻判定 `effective_at <= at` 同口径）；
+- 终点上的变更**不计入**（半开区间）；
+- 某时段内任一祖先无有效许可 → 该片段持续拒绝，`blockers` 给出 `no_valid_license`；
+- 每个片段返回 `start` / `end`、`allowed`、`basis`（各版本依据的变更）、`blockers`（全部阻断版本与原因）、`allowed_uses_intersection`。
+
+```bash
+curl -s "http://localhost:8000/permissions/timeline?version_id=demo-derived-1&use=review&start=2026-01-15T00:00:00Z&end=2026-07-15T00:00:00Z"
+```
+
+基于内置示例数据的响应（`basis` 字段从略，形状同单时刻判定）：
+
+```json
+{
+  "version_id": "demo-derived-1",
+  "use": "review",
+  "start": "2026-01-15T00:00:00Z",
+  "end": "2026-07-15T00:00:00Z",
+  "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+  "segments": [
+    {
+      "start": "2026-01-15T00:00:00Z",
+      "end": "2026-02-01T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-derived-1", "reason": "no_valid_license" },
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": []
+    },
+    {
+      "start": "2026-02-01T00:00:00Z",
+      "end": "2026-06-01T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": ["research"]
+    },
+    {
+      "start": "2026-06-01T00:00:00Z",
+      "end": "2026-07-15T00:00:00Z",
+      "allowed": false,
+      "blockers": [
+        { "version_id": "demo-root-a", "reason": "use_not_allowed", "change_id": "demo-chg-a-2" },
+        { "version_id": "demo-root-b", "reason": "use_not_allowed", "change_id": "demo-chg-b-1" }
+      ],
+      "allowed_uses_intersection": ["research"]
+    }
+  ]
+}
+```
+
+即：review 在 2 月 1 日前因派生版本尚无许可且 root-b 不含 review 被拒；2 月 1 日起仅剩 root-b 阻断；6 月 1 日 root-a 收紧后两个根版本共同阻断。换成 `use=research` 则第 2、3 段均为 `allowed=true`（6 月 1 日 root-a 的依据变更仍会切分片段，因为判定依据变了）。
+
+错误语义（一律不返回部分结果）：
+
+| 情形 | 结果 |
+| --- | --- |
+| 版本不存在 | `404 not_found` |
+| `start` / `end` 无时区或无法解析 | `422 invalid_time` |
+| `start >= end`（倒置或空区间；同一时刻的两种时区写法也算空区间） | `422 invalid_interval` |
+
+### 5. 预演许可变更（提交前影响分析，不写入）
+
+`POST /license-changes/preview`
+
+在**真正提交变更之前**，传入与提交接口相同的变更字段（变更标识、已登记版本、带时区的生效时刻、允许用途全集）外加待判定用途 `use` 与带时区的查询时刻 `at`，服务对同一份数据快照分别计算「现状」与「假设该变更已提交」两种判定，仅返回目标版本及其全部后代中**允许状态发生翻转**的版本。
+
+```bash
+curl -s -X POST http://localhost:8000/license-changes/preview \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "change_id": "preview-a-commercial",
+    "version_id": "demo-root-a",
+    "effective_at": "2026-04-01T00:00:00Z",
+    "allowed_uses": ["research", "review", "commercial"],
+    "use": "commercial",
+    "at": "2026-05-01T00:00:00Z"
+  }'
+```
+
+上例预演「2026-04 起给 `demo-root-a` 放开 commercial」对 5 月判定的影响，`impacted_versions` 会同时包含 `demo-root-a` 与后代 `demo-derived-1`，每条给出：
+
+- `before_allowed` / `after_allowed`：提交前、假设提交后的允许状态；
+- `before_blockers` / `after_blockers`：两个时点的**全部**阻断版本与原因（`no_valid_license` / `use_not_allowed`，字段口径同判定接口）；
+- `before_basis` / `after_basis`、`before/after_allowed_uses_intersection`：所依据的最近变更与祖先许可交集；
+- `closure`：该版本判定时展开的自身及全部祖先。
+
+顶层 `scope` 为本次计算覆盖的「目标版本 + 全部后代」（广度优先、去重，**菱形继承的后代只计一次**）；预演只做只读计算，绝不写入变更（可用 `GET /license-changes/{change_id}` 验证预演标识仍为 `404`）。
+
+不误报的两种情形（`impacted_versions` 为空数组）：
+
+- **查询时刻早于生效时刻**：变更尚未生效，前后判定一致；
+- **已有更晚（且不晚于查询时刻）的已登记变更覆盖该时刻**：按「最近有效变更」规则，预演变更不会成为依据。
+
+错误与幂等语义与 `POST /license-changes` 完全一致：
+
+| 情形 | 结果 |
+| --- | --- |
+| 目标版本不存在 | `404 not_found` |
+| 相同 `change_id` 已存在但内容不同 | `409 conflict` |
+| 同版本同生效时刻已存在**不同**变更 | `409 conflict` |
+| 相同标识与语义内容的重放 | `200` 且 `replayed=true`，`impacted_versions` 恒为空（现状与「重放后」本就相同，无影响） |
+| `effective_at` / `at` 无时区 | `422` |
+
+并发说明：预演在单个 SQLite WAL 只读快照事务内、并在进程级锁保护下一次性读取版本、父引用与变更，评估过程中其他请求的提交不会混入，不会出现「版本来自旧快照、变更来自新快照」的拼接结果。
+
+### 6. 作废许可变更（登记有误时撤回，幂等）
+
+`POST /license-changes/revocations`
+
+业务人员发现许可变更登记有误时，凭**原变更标识、唯一作废标识和原因**作废一条已登记变更。作废立即对所有查询时刻生效（单时点判定、区间分段、变更预演均忽略该变更），但**不删除原记录**。
+
+```bash
+curl -X POST http://localhost:8000/license-changes/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "change_id": "chg-c-1",
+    "revocation_id": "rev-chg-c-1-001",
+    "reason": "允许用途登记有误，撤回重报"
+  }'
+```
+
+首次作废返回 `201`：
+
+```json
+{
+  "replayed": false,
+  "receipt": {
+    "revocation_id": "rev-chg-c-1-001",
+    "change_id": "chg-c-1",
+    "reason": "允许用途登记有误，撤回重报",
+    "registered_at": "2026-10-04T09:00:00.000000Z"
+  }
+}
+```
+
+- 回执含**原标识** `change_id`、**作废标识** `revocation_id`、**原因** `reason`、**登记时间** `registered_at`（服务按 UTC 生成）；`revocation_id` 省略时自动生成 UUID；
+- 同一作废标识 + 同一原变更 + 同一原因重试 → `200` 且 `replayed=true`，返回**同一份原回执**（含首次登记时间）；
+- 复用同一作废标识但内容不同（指向另一原变更，或原因不同）→ `409 conflict`；
+- 以另一作废标识重复作废同一变更 → `409 conflict`（错误详情回传已存在的 `existing_revocation_id`）；
+- 目标变更不存在 → `404 not_found`；原因为空白 → `422`。
+
+作废后的查询行为：
+
+```bash
+# 原变更仍可按原接口查询，附带 revocation 回执
+curl -s http://localhost:8000/license-changes/chg-c-1
+
+# 回执可按作废标识追溯
+curl -s http://localhost:8000/license-changes/revocations/rev-chg-c-1-001
+
+# 单时点判定忽略它：若无其他未作废变更，按 no_valid_license 阻断
+curl -s "http://localhost:8000/permissions/check?version_id=dataset-c-v1&use=research&at=2026-07-01T00:00:00Z"
+```
+
+原变更的同标识重放规则不变——重放只会取回原记录（仍带作废标记），**不会恢复**为有效变更：
+
+```bash
+curl -X POST http://localhost:8000/license-changes -H 'Content-Type: application/json' \
+  -d '{"change_id":"chg-c-1","version_id":"dataset-c-v1","effective_at":"2026-03-01T00:00:00Z","allowed_uses":["research","review"]}'
+# -> 200 replayed=true，change.revocation 仍为原作废回执
+```
+
+### 7. 用途判定凭证（可追溯，判定与保存原子完成）
+
+`POST /permissions/vouchers` · `GET /permissions/vouchers/{voucher_id}`
+
+把一次用途判定固化为研究审批可追溯的凭证。首次请求在**单个 `BEGIN IMMEDIATE` 写事务**内、以同一一致快照完成「版本校验 → 祖先展开 → 沿用现有判定规则评估 → 写入凭证」，任一步失败全部回滚，**不留半成品凭证**。响应中的 `registered_at` 是服务按 UTC 生成的登记时间；`closure` / `basis` / `blockers` / `allowed_uses_intersection` 与 `GET /permissions/check` 的字段口径完全一致（`blockers` 为空即允许）。
+
+```bash
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "voucher_id": "approval-2026-03-research-001",
+    "version_id": "demo-derived-1",
+    "use": " research ",
+    "at": "2026-03-01T08:00:00+08:00"
+  }'
+```
+
+首次签发返回 `201`（`replayed=false`），拒绝同样返回 `201` 并在 `blockers` 中给出全部阻断版本与原因；用途与时刻在服务侧归一化（去首尾空格、换算 UTC）：
+
+```json
+{
+  "replayed": false,
+  "voucher": {
+    "voucher_id": "approval-2026-03-research-001",
+    "version_id": "demo-derived-1",
+    "use": "research",
+    "at": "2026-03-01T00:00:00Z",
+    "registered_at": "2026-10-05T01:23:45.123456Z",
+    "allowed": true,
+    "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+    "basis": [ { "version_id": "...", "change_id": "...", "effective_at": "...", "allowed_uses": ["..."] } ],
+    "blockers": [],
+    "allowed_uses_intersection": ["research"]
+  }
+}
+```
+
+- **重试幂等**：相同凭证标识 + 相同版本 + 去空格后相同用途 + UTC 归一化后相同时刻（如 `+08:00` 与 `Z` 两种写法指向同一瞬间）→ `200` 且 `replayed=true`，凭证内容与首次**逐字段一致**（含首次的 `registered_at`）；
+- **历史不可改写**：签发后即使原变更被收紧、作废，凭证查询与同输入重试都恒返回首次结果；实时接口 `GET /permissions/check` 的判定照常随当前数据变化，不受影响；
+- **标识复用冲突**：同一 `voucher_id` 提交不同版本/用途/时刻 → `409 conflict`（错误详情回传已存输入与本次输入），原凭证保持不变；
+- `voucher_id` 省略时服务自动生成 UUID（`p-` 前缀）。
+
+| 情形 | 结果 |
+| --- | --- |
+| 首次签发（允许或拒绝） | `201`，`replayed=false` |
+| 同标识 + 同版本 + 同用途（去空格）+ 同时刻（UTC 归一化）重试 | `200`，`replayed=true`，返回原凭证 |
+| 标识复用到不同输入 | `409 conflict` |
+| 凭证标识不存在（GET） | `404 not_found` |
+| 版本不存在 | `404 not_found`，不留凭证 |
+| 用途为空白 | `422`，不留凭证 |
+| `at` 无时区或无法解析 | `422 invalid_time`，不留凭证 |
+
+```bash
+# 按凭证标识追溯（恒为首次保存的结果）
+curl -s http://localhost:8000/permissions/vouchers/approval-2026-03-research-001
+
+# 同输入重试：+08:00 写法与 Z 指向同一 UTC 瞬间 -> 200 replayed=true
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"research","at":"2026-03-01T00:00:00Z"}'
+
+# 复用标识指向不同用途 -> 409
+curl -s -X POST http://localhost:8000/permissions/vouchers \
+  -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"commercial","at":"2026-03-01T00:00:00Z"}'
+```
+
+### 8. 查询接口
+
+| 方法与路径 | 说明 |
+| --- | --- |
+| `GET /health` | 健康检查 |
+| `GET /versions` | 列出全部版本（含父引用与变更；已作废变更带 `revocation` 回执） |
+| `GET /versions/{version_id}` | 版本详情，不存在返回 `404` |
+| `GET /license-changes/{change_id}` | 按标识查询变更（已作废仍可查，附 `revocation` 字段） |
+| `GET /license-changes/revocations/{revocation_id}` | 按作废标识追溯作废回执，不存在返回 `404` |
+| `POST /permissions/vouchers` | 把一次用途判定原子签发为可追溯凭证（首次 `201` / 同输入重试 `200` / 输入冲突 `409`） |
+| `GET /permissions/vouchers/{voucher_id}` | 追溯凭证，恒返回首次保存的判定；不存在返回 `404` |
+
+错误响应统一形如：
+
+```json
+{ "error": "conflict", "message": "……", "details": { } }
+```
+
+## 内置示例数据（SEED_DEMO=true 时）
+
+| 版本 | 父版本 | 变更 |
+| --- | --- | --- |
+| `demo-root-a` | — | 2026-01-01 起允许 `research, review`；2026-06-01 起仅 `research` |
+| `demo-root-b` | — | 2026-01-01 起允许 `research, commercial` |
+| `demo-derived-1` | a, b | 2026-02-01 起允许 `research, review, commercial`（实际许可 = 三者交集，仅 `research`） |
+| `demo-no-license` | — | 无任何变更，始终以 `no_valid_license` 阻断 |
+
+一键体验（启动后）：
+
+```bash
+bash examples/curl-examples.sh
+```
+
+## 本地开发（不使用 Docker）
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 初始化依赖即数据库建表在应用启动时自动完成（默认 DB_PATH=/data/licenses.db，
+# 本地运行建议指向可写路径）：
+DB_PATH=./data/licenses.db SEED_DEMO=true uvicorn app.main:app --reload --port 8000
+
+# 运行测试
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端）。
