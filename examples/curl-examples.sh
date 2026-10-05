@@ -130,3 +130,51 @@ echo "# 实时判定此刻可能已变化："
 curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-05-01T00:00:00Z"; echo
 echo "# 而凭证恒为首次保存的 allowed=true："
 curl -s "$BASE/permissions/vouchers/example-voucher-2"; echo
+
+say "证明包导出：按凭证标识导出签名证明包（首次 201：快照+算法+密钥标识+签名）"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包重复导出：200 replayed=true，内容与首次完全一致（不重签）"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包查询：GET 已固化的证明包（只读，不触发导出）"
+curl -s "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包错误 1：未知凭证 -> 404 not_found"
+curl -s -X POST "$BASE/permissions/vouchers/no-such-voucher/proof"; echo
+
+say "证明包错误 2：未导出过的凭证 GET -> 404 proof_not_exported"
+curl -s -X POST "$BASE/permissions/vouchers" -H 'Content-Type: application/json' \
+  -d '{"voucher_id":"example-voucher-3","version_id":"demo-root-a","use":"research","at":"2026-03-01T00:00:00Z"}' >/dev/null
+curl -s "$BASE/permissions/vouchers/example-voucher-3/proof"; echo
+
+say "签名公钥：列出全部密钥（含已轮换旧密钥，仅公钥信息）"
+curl -s "$BASE/signing-keys"; echo
+
+say "离线验签：保存证明包与公钥，本地核对 Ed25519 签名"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof" \
+  | python3 -c "import json,sys; json.dump(json.load(sys.stdin)['proof'], open('/tmp/proof.json','w'), ensure_ascii=False)"
+KEY_ID=$(python3 -c "import json; print(json.load(open('/tmp/proof.json'))['signature']['key_id'])")
+echo "# 证明包签名密钥：$KEY_ID"
+curl -s "$BASE/signing-keys/$KEY_ID" > /tmp/key.json
+python3 "$(dirname "$0")/verify_proof.py" /tmp/proof.json /tmp/key.json
+echo "# 篡改任一字段（如把 use 改成 commercial）后验签失败："
+python3 -c "
+import json
+proof = json.load(open('/tmp/proof.json'))
+proof['snapshot']['use'] = 'commercial'
+json.dump(proof, open('/tmp/proof-tampered.json','w'), ensure_ascii=False)
+"
+python3 "$(dirname "$0")/verify_proof.py" /tmp/proof-tampered.json /tmp/key.json || echo "# 已按预期拒绝（退出码 $?）"
+
+say "密钥轮换：新活跃密钥签名新导出；旧证明包与旧公钥仍可核验"
+curl -s -X POST "$BASE/signing-keys/rotate"; echo
+echo "# 轮换后首次导出 example-voucher-2 的证明包（用新密钥）："
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-2/proof" \
+  | python3 -c "import json,sys; p=json.load(sys.stdin)['proof']; print(p['signature']['key_id'], p['signature']['value'][:24] + '…')"
+echo "# 旧证明包原样返回（仍用旧密钥 $KEY_ID，不重签）："
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof" \
+  | python3 -c "import json,sys; p=json.load(sys.stdin)['proof']; print(p['signature']['key_id'], p['signature']['value'][:24] + '…')"
+echo "# 旧公钥仍可获取（status=retired），旧包验签仍通过："
+curl -s "$BASE/signing-keys/$KEY_ID" | python3 -c "import json,sys; k=json.load(sys.stdin); print(k['key_id'], k['status'])"
+python3 "$(dirname "$0")/verify_proof.py" /tmp/proof.json /tmp/key.json

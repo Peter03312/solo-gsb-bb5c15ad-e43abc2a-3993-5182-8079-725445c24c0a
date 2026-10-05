@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
 from .database import Database
+from .proof import (
+    PROOF_ALGORITHM,
+    PROOF_ENCODING_RULES,
+    KeyStore,
+    KeyUnavailableError,
+    canonical_json,
+)
 
 # Canonical UTC timestamp used for storage and lexicographic comparison in SQL.
 # Example: 2026-03-01T08:30:00.000000Z
@@ -78,6 +85,16 @@ class InvalidTimeError(ServiceError):
 class InvalidIntervalError(ServiceError):
     status_code = 422
     code = "invalid_interval"
+
+
+class ProofNotExportedError(ServiceError):
+    status_code = 404
+    code = "proof_not_exported"
+
+
+class SigningKeyUnavailableError(ServiceError):
+    status_code = 503
+    code = "signing_key_unavailable"
 
 
 # -- serialisation ---------------------------------------------------------
@@ -168,6 +185,45 @@ def _thaw_decision(blob: str) -> dict[str, Any]:
     }
 
 
+def _proof_snapshot(voucher: dict[str, Any]) -> dict[str, Any]:
+    """首次判定的完整快照，即证明包中被签名的内容。
+
+    时间戳直接使用存储的定长 UTC 字符串（``YYYY-MM-DDTHH:MM:SS.ffffffZ``），
+    因此同一凭证行重建出的快照逐字节稳定；对它做 canonical-json-v1 序列化
+    即得被签名的消息。凭证行本身是不可变历史，快照内容永不改变。
+    """
+    decision = json.loads(voucher["decision_json"])
+    return {
+        "voucher_id": voucher["voucher_id"],
+        "version_id": voucher["version_id"],
+        "use": voucher["use_name"],
+        "at": voucher["at_value"],
+        "registered_at": voucher["registered_at"],
+        "allowed": bool(decision["allowed"]),
+        "closure": list(decision["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": entry["effective_at"],
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in decision["basis"]
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": entry.get("effective_at"),
+                "allowed_uses": list(entry.get("allowed_uses", ())),
+            }
+            for entry in decision["blockers"]
+        ],
+        "allowed_uses_intersection": list(decision["allowed_uses_intersection"]),
+    }
+
+
 def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
     changes = []
     for change in db.list_changes(row["version_id"]):
@@ -186,8 +242,9 @@ def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
 
 
 class LicenseService:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, key_store: KeyStore | None = None) -> None:
         self.db = db
+        self.key_store = key_store
 
     # -- versions ---------------------------------------------------------
 
@@ -741,6 +798,121 @@ class LicenseService:
             "registered_at": parse_canonical(row["registered_at"]),
             **decision,
         }
+
+    # -- voucher proof packages (offline verification) ----------------------
+
+    def export_voucher_proof(self, voucher_id: str) -> tuple[dict[str, Any], bool]:
+        """Fix and return the signed proof package for a stored voucher.
+
+        The first export signs the canonical snapshot of the voucher's frozen
+        first decision with the active signing key and persists the signature
+        in one write transaction — the package is fixed atomically. Repeated
+        or concurrent exports return the identical stored package; the proof
+        row is never updated, so old packages are never re-signed (key
+        rotation only affects vouchers exported for the first time later).
+        Any stored voucher can be exported, including ones issued before this
+        feature existed. Returns ``(proof, replayed)``.
+        """
+        with self.db.lock:
+            voucher = self.db.get_voucher(voucher_id)
+            if voucher is None:
+                raise NotFoundError("判定凭证不存在", {"voucher_id": voucher_id})
+
+            existing = self.db.get_proof(voucher_id)
+            if existing is not None:
+                # Already fixed: return the same package, never re-sign.
+                return self._proof_out(voucher, existing), True
+
+            snapshot = _proof_snapshot(voucher)
+            payload = canonical_json(snapshot).encode("utf-8")
+            key_id, signature = self._sign(payload)
+            fixed = to_canonical(now_utc())
+            try:
+                self.db.begin()
+                self.db.insert_proof(
+                    voucher_id, key_id, PROOF_ALGORITHM, signature, fixed
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # A concurrent exporter won the primary key: its stored row is
+                # the single fixed package everyone must return.
+                raced = self.db.get_proof(voucher_id)
+                if raced is not None:
+                    return self._proof_out(voucher, raced), True
+                raise
+
+            stored = self.db.get_proof(voucher_id)
+            assert stored is not None
+            return self._proof_out(voucher, stored), False
+
+    def get_voucher_proof(self, voucher_id: str) -> dict[str, Any]:
+        """Return the already-fixed proof package (read-only, never signs)."""
+        with self.db.lock:
+            voucher = self.db.get_voucher(voucher_id)
+            if voucher is None:
+                raise NotFoundError("判定凭证不存在", {"voucher_id": voucher_id})
+            proof = self.db.get_proof(voucher_id)
+            if proof is None:
+                raise ProofNotExportedError(
+                    "该凭证尚未导出证明包，请先经 POST 导出",
+                    {"voucher_id": voucher_id},
+                )
+            return self._proof_out(voucher, proof)
+
+    def _sign(self, payload: bytes) -> tuple[str, str]:
+        if self.key_store is None:
+            raise SigningKeyUnavailableError("服务未配置签名密钥，无法导出证明包")
+        try:
+            return self.key_store.sign(payload)
+        except KeyUnavailableError as exc:
+            raise SigningKeyUnavailableError(str(exc)) from exc
+
+    @staticmethod
+    def _proof_out(voucher: dict[str, Any], proof: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "voucher_id": voucher["voucher_id"],
+            "snapshot": _proof_snapshot(voucher),
+            "signature": {
+                "algorithm": proof["algorithm"],
+                "key_id": proof["key_id"],
+                "value": proof["signature"],
+                "encoding": dict(PROOF_ENCODING_RULES),
+            },
+            "fixed_at": proof["created_at"],
+        }
+
+    # -- signing keys ---------------------------------------------------------
+
+    def _keys(self) -> KeyStore:
+        if self.key_store is None:
+            raise SigningKeyUnavailableError("服务未配置签名密钥")
+        return self.key_store
+
+    def list_signing_keys(self) -> dict[str, Any]:
+        """Public info of every stored key (active and retired alike)."""
+        try:
+            return self._keys().list_keys()
+        except KeyUnavailableError as exc:
+            raise SigningKeyUnavailableError(str(exc)) from exc
+
+    def get_signing_key(self, key_id: str) -> dict[str, Any]:
+        """Public key and verification rules for one key id (404 if unknown)."""
+        try:
+            info = self._keys().public_key_info(key_id)
+        except KeyUnavailableError as exc:
+            raise SigningKeyUnavailableError(str(exc)) from exc
+        if info is None:
+            raise NotFoundError("签名密钥不存在", {"key_id": key_id})
+        return info
+
+    def rotate_signing_key(self) -> dict[str, Any]:
+        """Rotate the active signing key; old keys and proofs stay verifiable."""
+        try:
+            active, previous = self._keys().rotate()
+        except KeyUnavailableError as exc:
+            raise SigningKeyUnavailableError(str(exc)) from exc
+        return {"previous_key_id": previous, "active_key": active}
 
     # -- change preview (no writes) ---------------------------------------
 

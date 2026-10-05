@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import copy
+import json
+import os
 from datetime import datetime, timezone
 
 import pytest
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from fastapi.testclient import TestClient
 
 from app.config import Settings
@@ -1462,3 +1468,346 @@ def test_timeline_on_demo_seed(tmp_path):
             for entry in research["segments"][2]["basis"]
         }
         assert basis_june["demo-root-a"] == "demo-chg-a-2"
+
+
+# -- voucher proof packages (offline verification) ---------------------------
+
+
+def _canonical_bytes(snapshot) -> bytes:
+    """canonical-json-v1：与证明包 encoding 规则逐字节一致的离线重建。"""
+    return json.dumps(
+        snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _verify_proof(public_key_pem: str, proof) -> None:
+    pub = load_pem_public_key(public_key_pem.encode("utf-8"))
+    pub.verify(
+        base64.b64decode(proof["signature"]["value"]),
+        _canonical_bytes(proof["snapshot"]),
+    )
+
+
+def _export_proof(client, voucher_id):
+    return client.post(f"/permissions/vouchers/{voucher_id}/proof")
+
+
+def _get_proof(client, voucher_id):
+    return client.get(f"/permissions/vouchers/{voucher_id}/proof")
+
+
+def _get_key(client, key_id):
+    return client.get(f"/signing-keys/{key_id}")
+
+
+def _public_key_of(client, proof) -> str:
+    resp = _get_key(client, proof["signature"]["key_id"])
+    assert resp.status_code == 200, resp.text
+    return resp.json()["public_key_pem"]
+
+
+def test_proof_export_signs_first_snapshot_and_verifies(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "v-ok", "d1", "research", _iso(2026, 5, 1))
+
+    resp = _export_proof(client, "v-ok")
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["replayed"] is False
+    proof = body["proof"]
+    assert proof["voucher_id"] == "v-ok"
+    assert proof["fixed_at"].endswith("Z")
+
+    snap = proof["snapshot"]
+    # 完整快照：版本、用途、判定时刻、登记时刻、祖先、依据、阻断、交集都在内。
+    assert snap["voucher_id"] == "v-ok"
+    assert snap["version_id"] == "d1"
+    assert snap["use"] == "research"
+    assert snap["at"] == "2026-05-01T00:00:00.000000Z"  # 定长 UTC 规范形式
+    assert snap["registered_at"].endswith("Z") and "." in snap["registered_at"]
+    assert snap["allowed"] is True
+    assert snap["closure"] == ["d1", "a"]
+    assert {entry["version_id"] for entry in snap["basis"]} == {"d1", "a"}
+    assert snap["blockers"] == []
+    assert snap["allowed_uses_intersection"] == ["research"]
+
+    sig = proof["signature"]
+    assert sig["algorithm"] == "Ed25519"
+    assert sig["key_id"]
+    assert sig["value"]
+    assert sig["encoding"]["payload_format"] == "canonical-json-v1"
+
+    # 与凭证内容一致（时刻的字符串格式不同：证明包用定长规范形式）。
+    voucher = _get_voucher(client, "v-ok").json()
+    assert snap["use"] == voucher["use"]
+    assert snap["allowed"] == voucher["allowed"]
+    assert snap["closure"] == voucher["closure"]
+    assert snap["basis"][0]["change_id"] == voucher["basis"][0]["change_id"]
+
+    # 用服务发布的公钥离线验签通过。
+    key = _get_key(client, sig["key_id"]).json()
+    assert key["status"] == "active"
+    assert key["algorithm"] == "Ed25519"
+    assert key["encoding"]["payload_format"] == "canonical-json-v1"
+    _verify_proof(key["public_key_pem"], proof)
+
+
+def test_proof_snapshot_denied_voucher_with_null_blocker_fields(client):
+    _register(client, "a")  # 无任何许可变更
+    _issue_voucher(client, "v-no", "a", "research", _iso(2026, 5, 1))
+
+    proof = _export_proof(client, "v-no").json()["proof"]
+    snap = proof["snapshot"]
+    assert snap["allowed"] is False
+    assert snap["basis"] == []
+    assert snap["blockers"] == [
+        {
+            "version_id": "a",
+            "reason": "no_valid_license",
+            "change_id": None,
+            "effective_at": None,
+            "allowed_uses": [],
+        }
+    ]
+    assert snap["allowed_uses_intersection"] == []
+    _verify_proof(_public_key_of(client, proof), proof)
+
+
+def test_proof_export_repeat_returns_identical_package(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+
+    first = _export_proof(client, "v1")
+    assert first.status_code == 201
+    second = _export_proof(client, "v1")
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+    # 重复导出返回同一内容（同一密钥、同一签名，不重签）。
+    assert second.json()["proof"] == first.json()["proof"]
+
+    fetched = _get_proof(client, "v1")
+    assert fetched.status_code == 200
+    assert fetched.json() == first.json()["proof"]
+
+
+def test_proof_tampering_any_field_fails_verification(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _register(client, "d1", ["a"])
+    _change(client, "cd1", "d1", _iso(2026, 1, 1), ["research"])
+    # 拒绝的凭证：basis 与 blockers 都非空，覆盖所有字段类型。
+    _issue_voucher(client, "v-no", "d1", "review", _iso(2026, 5, 1))
+    proof = _export_proof(client, "v-no").json()["proof"]
+    assert proof["snapshot"]["basis"] and proof["snapshot"]["blockers"]
+    public_pem = _public_key_of(client, proof)
+
+    _verify_proof(public_pem, proof)  # 未篡改时通过
+
+    mutations = [
+        lambda s: s.update(version_id="a"),  # 版本
+        lambda s: s.update(use="research"),  # 用途
+        lambda s: s.update(at="2026-06-01T00:00:00.000000Z"),  # 判定时刻
+        lambda s: s.update(registered_at="2027-01-01T00:00:00.000000Z"),  # 登记时刻
+        lambda s: s["closure"].append("ghost"),  # 祖先
+        lambda s: s["closure"].pop(0),  # 祖先（删除）
+        lambda s: s["basis"][0].update(change_id="other"),  # 依据
+        lambda s: s["basis"][0]["allowed_uses"].append("commercial"),  # 依据用途
+        lambda s: s["blockers"][0].update(reason="no_valid_license"),  # 阻断原因
+        lambda s: s["blockers"].pop(0),  # 阻断（删除）
+        lambda s: s["allowed_uses_intersection"].append("review"),  # 用途交集
+        lambda s: s.update(allowed=True),  # 判定结果
+        lambda s: s.update(voucher_id="v-other"),  # 凭证标识
+    ]
+    for mutate in mutations:
+        tampered = copy.deepcopy(proof)
+        mutate(tampered["snapshot"])
+        with pytest.raises(InvalidSignature):
+            _verify_proof(public_pem, tampered)
+
+
+def test_proof_export_unknown_voucher_is_404(client):
+    resp = _export_proof(client, "ghost")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert _get_proof(client, "ghost").status_code == 404
+
+
+def test_get_proof_before_export_is_404(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+
+    resp = _get_proof(client, "v1")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "proof_not_exported"
+
+    exported = _export_proof(client, "v1")
+    assert exported.status_code == 201
+    assert _get_proof(client, "v1").json() == exported.json()["proof"]
+
+
+def test_proof_export_historical_voucher_after_revocation(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    at = _iso(2026, 5, 1)
+    frozen = _issue_voucher(client, "v1", "a", "review", at).json()["voucher"]
+    assert frozen["allowed"] is True
+
+    # 作废依据变更后，历史凭证不变；导出的是首次判定快照，且验签通过。
+    assert _revoke(client, "ca", "r1", "登记有误").status_code == 201
+    proof = _export_proof(client, "v1").json()["proof"]
+    assert proof["snapshot"]["allowed"] is True
+    assert proof["snapshot"]["basis"][0]["change_id"] == "ca"
+    assert proof["snapshot"]["blockers"] == []
+    _verify_proof(_public_key_of(client, proof), proof)
+
+
+def test_proof_concurrent_export_fixes_exactly_once(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    outcomes: list[tuple[str, bool, dict]] = []
+    lock = __import__("threading").Lock()
+
+    def worker() -> None:
+        try:
+            proof, replayed = service.export_voucher_proof("v1")
+            with lock:
+                outcomes.append(("ok", replayed, proof))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append((type(exc).__name__, False, {}))
+
+    import threading
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(name == "ok" for name, _, _ in outcomes), outcomes
+    # 恰一次首次固化，其余都是重放；所有返回内容完全一致。
+    assert sum(1 for _, replayed, _ in outcomes if not replayed) == 1
+    first = outcomes[0][2]
+    assert all(proof == first for _, _, proof in outcomes)
+    assert _get_proof(client, "v1").json()["signature"] == first["signature"]
+
+
+def test_signing_key_rotation_keeps_old_proofs_and_public_keys(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+    _issue_voucher(client, "v2", "a", "research", _iso(2026, 6, 1))
+
+    proof1 = _export_proof(client, "v1").json()["proof"]
+    key1 = proof1["signature"]["key_id"]
+
+    rotated = client.post("/signing-keys/rotate")
+    assert rotated.status_code == 201
+    body = rotated.json()
+    assert body["previous_key_id"] == key1
+    key2 = body["active_key"]["key_id"]
+    assert key2 != key1
+    assert body["active_key"]["status"] == "active"
+
+    # 轮换后首次导出的证明包用新密钥。
+    proof2 = _export_proof(client, "v2").json()["proof"]
+    assert proof2["signature"]["key_id"] == key2
+
+    # 旧证明包不重签：重复导出与首次逐字节一致。
+    again = _export_proof(client, "v1")
+    assert again.status_code == 200
+    assert again.json()["proof"] == proof1
+    assert again.json()["proof"]["signature"]["key_id"] == key1
+
+    # 旧公钥仍可获取（标记 retired），新旧证明包各自验签通过。
+    old_key = _get_key(client, key1).json()
+    assert old_key["status"] == "retired"
+    new_key = _get_key(client, key2).json()
+    assert new_key["status"] == "active"
+    _verify_proof(old_key["public_key_pem"], proof1)
+    _verify_proof(new_key["public_key_pem"], proof2)
+
+    # 列表包含新旧两个密钥。
+    listing = client.get("/signing-keys").json()
+    assert listing["active_key_id"] == key2
+    assert {k["key_id"] for k in listing["keys"]} == {key1, key2}
+
+
+def test_signing_key_unavailable_reports_clear_error(tmp_path):
+    key_dir = tmp_path / "keys"
+    settings = Settings(
+        db_path=str(tmp_path / "t.db"),
+        init_db=True,
+        seed_demo=False,
+        echo=False,
+        signing_key_dir=str(key_dir),
+    )
+    with TestClient(create_app(settings)) as client:
+        _register(client, "a")
+        _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+        _issue_voucher(client, "v1", "a", "research", _iso(2026, 5, 1))
+        _issue_voucher(client, "v2", "a", "research", _iso(2026, 6, 1))
+        fixed = _export_proof(client, "v1")
+        assert fixed.status_code == 201
+
+        # 活跃私钥丢失 -> 密钥不可用。
+        active = client.get("/signing-keys").json()["active_key_id"]
+        os.remove(key_dir / f"{active}.key")
+
+        # 已固化的证明包不需要私钥，仍返回同一内容。
+        again = _export_proof(client, "v1")
+        assert again.status_code == 200
+        assert again.json()["proof"] == fixed.json()["proof"]
+
+        # 新的首次导出明确报错 503，且不留半成品。
+        resp = _export_proof(client, "v2")
+        assert resp.status_code == 503
+        assert resp.json()["error"] == "signing_key_unavailable"
+        assert _get_proof(client, "v2").status_code == 404
+
+        # 公钥仍可获取（验签不依赖私钥）；其余接口不受影响。
+        assert _get_key(client, active).status_code == 200
+        assert _check(client, "a", "research", _iso(2026, 5, 1)).status_code == 200
+        assert _get_voucher(client, "v1").status_code == 200
+
+
+def test_unknown_signing_key_is_404(client):
+    resp = _get_key(client, "k-no-such-key")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+
+
+def test_proof_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-proof.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as client:
+        resp = client.post(
+            "/permissions/vouchers",
+            json={
+                "voucher_id": "demo-voucher-proof",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert resp.status_code == 201
+
+        exported = client.post("/permissions/vouchers/demo-voucher-proof/proof")
+        assert exported.status_code == 201
+        proof = exported.json()["proof"]
+        snap = proof["snapshot"]
+        assert snap["allowed"] is False
+        assert snap["closure"] == ["demo-derived-1", "demo-root-a", "demo-root-b"]
+        assert any(
+            bl["version_id"] == "demo-root-b" and bl["reason"] == "use_not_allowed"
+            for bl in snap["blockers"]
+        )
+        key = client.get(f"/signing-keys/{proof['signature']['key_id']}").json()
+        _verify_proof(key["public_key_pem"], proof)

@@ -12,6 +12,8 @@ services:
       DB_PATH: "/data/licenses.db"
       INIT_DB: "${INIT_DB:-true}"
       SEED_DEMO: "${SEED_DEMO:-true}"
+      # 本地 Ed25519 签名密钥目录（凭证证明包），默认随数据卷持久化
+      SIGNING_KEY_DIR: "${SIGNING_KEY_DIR:-/data/keys}"
     volumes:
       - license-data:/data
     restart: unless-stopped

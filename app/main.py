@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 
 from .config import Settings, settings as default_settings
 from .database import Database
+from .proof import KeyStore, KeyUnavailableError
 from .schemas import (
     BasisEntry,
     BlockerEntry,
@@ -30,10 +31,15 @@ from .schemas import (
     PreviewResponse,
     RevocationReceipt,
     RevocationResponse,
+    RotateSigningKeyResponse,
+    SigningKeyInfo,
+    SigningKeyListResponse,
     VersionCreateRequest,
     VersionResponse,
     VoucherDecision,
     VoucherIssueRequest,
+    VoucherProof,
+    VoucherProofResponse,
     VoucherResponse,
 )
 from .seed import seed_demo_data
@@ -79,14 +85,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             seed_demo_data(db)
         if settings.echo:
             logger.info(
-                "配置 DB_PATH=%s HOST=%s PORT=%s INIT_DB=%s SEED_DEMO=%s",
+                "配置 DB_PATH=%s HOST=%s PORT=%s INIT_DB=%s SEED_DEMO=%s SIGNING_KEY_DIR=%s",
                 settings.db_path,
                 settings.host,
                 settings.port,
                 settings.init_db,
                 settings.seed_demo,
+                settings.resolved_signing_key_dir,
             )
-        app.state.app_state = AppState(db, LicenseService(db))
+        key_store = KeyStore(settings.resolved_signing_key_dir)
+        try:
+            key_store.ensure_ready()
+            logger.info("签名密钥就绪：%s", settings.resolved_signing_key_dir)
+        except KeyUnavailableError as exc:
+            # 密钥不可用不阻断启动：其余接口照常，导出证明包时明确报 503。
+            logger.warning("签名密钥不可用：%s", exc)
+        app.state.app_state = AppState(db, LicenseService(db, key_store=key_store))
         try:
             yield
         finally:
@@ -370,6 +384,79 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_voucher(voucher_id: str, request: Request) -> VoucherDecision:
         return VoucherDecision(**service_from(request).get_voucher(voucher_id))
+
+    # -- voucher proof packages (offline verification) ----------------------
+
+    @app.post(
+        "/permissions/vouchers/{voucher_id}/proof",
+        response_model=VoucherProofResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="导出凭证的签名证明包（首次导出原子固化，重复/并发导出返回同一内容）",
+        responses={
+            200: {"description": "重复或并发导出，返回首次固化的同一证明包（不重签）"},
+            201: {"description": "首次导出：首次判定快照已用活跃密钥签名并固化"},
+            404: {"description": "凭证不存在"},
+            503: {"description": "签名密钥不可用"},
+        },
+    )
+    def export_voucher_proof(
+        voucher_id: str, request: Request
+    ) -> JSONResponse | VoucherProofResponse:
+        proof, replayed = service_from(request).export_voucher_proof(voucher_id)
+        body = VoucherProofResponse(replayed=replayed, proof=VoucherProof(**proof))
+        if replayed:
+            # 200 OK distinguishes a repeated export from the first fixing.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/vouchers/{voucher_id}/proof",
+        response_model=VoucherProof,
+        tags=["permissions"],
+        summary="查询已固化的证明包（只读，不触发导出与签名）",
+        responses={
+            404: {"description": "凭证不存在，或该凭证尚未导出证明包"},
+        },
+    )
+    def get_voucher_proof(voucher_id: str, request: Request) -> VoucherProof:
+        return VoucherProof(**service_from(request).get_voucher_proof(voucher_id))
+
+    # -- signing keys ---------------------------------------------------------
+
+    @app.get(
+        "/signing-keys",
+        response_model=SigningKeyListResponse,
+        tags=["signing-keys"],
+        summary="列出全部签名密钥的公钥（含已轮换的旧密钥）",
+        responses={503: {"description": "签名密钥不可用"}},
+    )
+    def list_signing_keys(request: Request) -> SigningKeyListResponse:
+        return SigningKeyListResponse(**service_from(request).list_signing_keys())
+
+    @app.get(
+        "/signing-keys/{key_id}",
+        response_model=SigningKeyInfo,
+        tags=["signing-keys"],
+        summary="按密钥标识获取公钥与验签编码规则",
+        responses={
+            404: {"description": "密钥不存在"},
+            503: {"description": "签名密钥不可用"},
+        },
+    )
+    def get_signing_key(key_id: str, request: Request) -> SigningKeyInfo:
+        return SigningKeyInfo(**service_from(request).get_signing_key(key_id))
+
+    @app.post(
+        "/signing-keys/rotate",
+        response_model=RotateSigningKeyResponse,
+        status_code=201,
+        tags=["signing-keys"],
+        summary="轮换活跃签名密钥（旧密钥保留，旧证明包与旧公钥仍可核验）",
+        responses={503: {"description": "签名密钥不可用"}},
+    )
+    def rotate_signing_key(request: Request) -> RotateSigningKeyResponse:
+        return RotateSigningKeyResponse(**service_from(request).rotate_signing_key())
 
     return app
 

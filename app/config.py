@@ -29,6 +29,16 @@ class Settings:
     seed_demo: bool = _as_bool(os.getenv("SEED_DEMO"), default=True)
     # Print resolved configuration at startup (useful for container logs).
     echo: bool = _as_bool(os.getenv("CONFIG_ECHO"), default=True)
+    # Directory holding the local Ed25519 signing keys used for voucher proof
+    # packages. Empty means "next to the database": <dirname(DB_PATH)>/keys,
+    # which inside Compose resolves to /data/keys (same persistent volume).
+    signing_key_dir: str = os.getenv("SIGNING_KEY_DIR", "")
+
+    @property
+    def resolved_signing_key_dir(self) -> str:
+        if self.signing_key_dir:
+            return self.signing_key_dir
+        return os.path.join(os.path.dirname(os.path.abspath(self.db_path)), "keys")
 
     @property
     def base_url(self) -> str:

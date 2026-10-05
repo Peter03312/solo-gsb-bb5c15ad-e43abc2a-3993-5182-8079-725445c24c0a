@@ -76,6 +76,20 @@ SCHEMA_STATEMENTS = [
         decision_json  TEXT NOT NULL
     )
     """,
+    # A voucher proof freezes the first export of a voucher: the signed
+    # snapshot is always derived from the immutable voucher row, so this table
+    # only records which key signed it and the resulting signature. Rows are
+    # never updated or deleted — old packages are never re-signed, and key
+    # rotation only affects vouchers exported for the first time afterwards.
+    """
+    CREATE TABLE IF NOT EXISTS voucher_proofs (
+        voucher_id  TEXT PRIMARY KEY REFERENCES permission_vouchers(voucher_id),
+        key_id      TEXT NOT NULL,
+        algorithm   TEXT NOT NULL,
+        signature   TEXT NOT NULL,
+        created_at  TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -333,4 +347,26 @@ class Database:
                 1 if allowed else 0,
                 decision_json,
             ),
+        )
+
+    # -- voucher proofs -----------------------------------------------------
+
+    def get_proof(self, voucher_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM voucher_proofs WHERE voucher_id = ?", (voucher_id,)
+        )
+
+    def insert_proof(
+        self,
+        voucher_id: str,
+        key_id: str,
+        algorithm: str,
+        signature: str,
+        created_at: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO voucher_proofs "
+            "(voucher_id, key_id, algorithm, signature, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (voucher_id, key_id, algorithm, signature, created_at),
         )

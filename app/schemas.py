@@ -236,6 +236,89 @@ class VoucherResponse(BaseModel):
     voucher: VoucherDecision
 
 
+# -- voucher proof packages (offline verification) ---------------------------
+
+
+class ProofBasisEntry(BaseModel):
+    version_id: str
+    change_id: str
+    effective_at: str = Field(description="定长 UTC 时间戳 YYYY-MM-DDTHH:MM:SS.ffffffZ")
+    allowed_uses: list[str]
+
+
+class ProofBlockerEntry(BaseModel):
+    version_id: str
+    reason: Literal["no_valid_license", "use_not_allowed"]
+    change_id: str | None = None
+    effective_at: str | None = Field(
+        default=None, description="定长 UTC 时间戳；no_valid_license 时为 null"
+    )
+    allowed_uses: list[str] = Field(default_factory=list)
+
+
+class ProofSnapshot(BaseModel):
+    """首次判定的完整快照（被签名内容）；时间戳为定长 UTC 字符串。"""
+
+    voucher_id: str
+    version_id: str
+    use: str
+    at: str = Field(description="判定时刻，定长 UTC 字符串")
+    registered_at: str = Field(description="凭证登记时刻，定长 UTC 字符串")
+    allowed: bool
+    closure: list[str] = Field(description="首次判定时的自身及全部祖先（去重、广度优先）")
+    basis: list[ProofBasisEntry] = Field(default_factory=list)
+    blockers: list[ProofBlockerEntry] = Field(default_factory=list)
+    allowed_uses_intersection: list[str] = Field(default_factory=list)
+
+
+class ProofSignature(BaseModel):
+    algorithm: str = Field(description="签名算法（Ed25519）")
+    key_id: str = Field(
+        description="签名密钥标识；经 GET /signing-keys/{key_id} 获取对应公钥"
+    )
+    value: str = Field(description="签名值，base64（RFC 4648，含填充）")
+    encoding: dict[str, str] = Field(
+        description="验签编码规则：snapshot 的 canonical-json-v1 序列化即被签名消息"
+    )
+
+
+class VoucherProof(BaseModel):
+    """凭证的签名证明包：首次导出时原子固化，之后永不重签。"""
+
+    voucher_id: str
+    snapshot: ProofSnapshot
+    signature: ProofSignature
+    fixed_at: str = Field(description="证明包首次导出（固化）时刻，定长 UTC 字符串")
+
+
+class VoucherProofResponse(BaseModel):
+    replayed: bool = Field(
+        description="重复或并发导出时为 true，证明包内容与首次导出完全一致"
+    )
+    proof: VoucherProof
+
+
+class SigningKeyInfo(BaseModel):
+    key_id: str
+    algorithm: str = Field(description="签名算法（Ed25519）")
+    status: Literal["active", "retired"] = Field(
+        description="active 为当前活跃密钥；retired 为已轮换旧密钥（公钥仍可验旧包）"
+    )
+    created_at: str = Field(description="密钥生成时刻，定长 UTC 字符串")
+    public_key_pem: str = Field(description="PEM（SubjectPublicKeyInfo）编码的公钥")
+    encoding: dict[str, str] = Field(description="验签编码规则")
+
+
+class SigningKeyListResponse(BaseModel):
+    active_key_id: str | None
+    keys: list[SigningKeyInfo]
+
+
+class RotateSigningKeyResponse(BaseModel):
+    previous_key_id: str | None = Field(description="轮换前的活跃密钥标识；首次轮换为 null")
+    active_key: SigningKeyInfo = Field(description="轮换后的新活跃密钥（仅公钥信息）")
+
+
 # -- change preview --------------------------------------------------------
 
 
