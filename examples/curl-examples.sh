@@ -130,3 +130,33 @@ echo "# 实时判定此刻可能已变化："
 curl -s "$BASE/permissions/check?version_id=demo-derived-1&use=research&at=2026-05-01T00:00:00Z"; echo
 echo "# 而凭证恒为首次保存的 allowed=true："
 curl -s "$BASE/permissions/vouchers/example-voucher-2"; echo
+
+say "证明包：首次导出 example-voucher-1 -> 201（签名并原子固化）"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包重复导出 -> 200 replayed=true，返回同一内容（旧包不重签）"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包只读取回（GET 不触发签名；未导出过的凭证返回 404 proof_not_exported）"
+curl -s "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+say "证明包：未知凭证 -> 404 not_found（不留任何证明行）"
+curl -s -X POST "$BASE/permissions/vouchers/no-such-voucher/proof"; echo
+
+say "公钥：列出全部保留公钥（含轮换前旧公钥）与当前活跃密钥"
+curl -s "$BASE/signing/keys"; echo
+
+say "轮换活跃签名密钥：生成并启用新密钥，旧公钥仍可取回"
+curl -s -X POST "$BASE/signing/keys/rotate"; echo
+
+say "轮换后旧证明包仍是原签名（kid 不变、不重签），用旧公钥仍可离线验签"
+curl -s -X POST "$BASE/permissions/vouchers/example-voucher-1/proof"; echo
+
+echo
+echo "离线验签（把证明包存为文件后）："
+echo "  curl -s -X POST $BASE/permissions/vouchers/example-voucher-1/proof > proof.json"
+echo "  python3 examples/offline-verify-proof.py proof.json"
+echo "  # 用独立渠道取得的公钥交叉核验："
+echo "  KID=\$(python3 -c \"import json;print(json.load(open('proof.json'))['proof']['signature']['key_id'])\")"
+echo "  curl -s $BASE/signing/keys/\$KID/public | python3 -c \"import json,sys;print(json.load(sys.stdin)['public_key_pem'])\" > key.pem"
+echo "  python3 examples/offline-verify-proof.py proof.json --public-key key.pem"

@@ -23,6 +23,7 @@
 - **用途判定凭证（可追溯）**：研究审批可把一次用途判定**固化为凭证**（`POST /permissions/vouchers`）。请求携带**唯一凭证标识、已登记版本、用途、带时区的判定时刻**；首次请求在**同一一致数据视图**中沿用现有判定规则，把服务按 UTC 生成的**登记时间**连同**完整祖先闭包、依据（basis）、阻断原因（blockers）与用途交集**一次性持久保存——**允许与拒绝都留痕**。判定与保存在**单个写事务内原子完成，失败不留半成品**。
   - 凭证是**不可变历史**：`GET /permissions/vouchers/{voucher_id}` 始终返回**首次保存**的结果；之后的许可变更或作废只影响实时判定与预演，**不能改写历史凭证**。
   - **幂等与冲突**：相同凭证标识、相同版本、**去首尾空格后相同的用途**、**换算为 UTC 后相同的判定时刻**重试 → `200` 且 `replayed=true`，返回原凭证；同一标识复用到不同输入（版本/用途/时刻任一不同）→ `409 conflict`；未知凭证 → `404 not_found`；未知版本 → `404`；空用途或无时区时刻 → `422`，且**均不留凭证**。
+- **离线审计证明包（签名固定）**：已签发凭证可按标识导出自包含证明包（`POST /permissions/vouchers/{id}/proof`），内含**首次判定完整快照、签名算法（Ed25519/JWS EdDSA）、密钥标识、签名与明确验签编码规则**；签名覆盖版本、用途、判定时刻、登记时刻、祖先、依据、阻断原因与用途交集（顺序敏感），**篡改任一字段均无法通过验签**。首次导出**原子固化**，重复或并发导出返回同一内容；历史凭证同样可导出，未知凭证明确报错。签名密钥为**本地持久密钥**（`SIGNING_KEYS_DIR`），**轮换活跃密钥后旧证明包与旧公钥仍可核验、旧包绝不重签**，密钥不可用时明确报 `503`。详见下文第 8–10 节。
 - **幂等与冲突**：
   - 相同**变更标识**且语义内容（版本、生效时刻、允许用途集合；用途顺序/重复不影响）完全相同的重复提交，返回**同一结果**（HTTP `200`，`replayed=true`）；
   - 标识相同而内容不同 → `409 conflict`；
@@ -36,12 +37,17 @@
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由与异常映射
-│   ├── service.py     # 核心业务逻辑（登记 / 变更 / 判定 / 幂等冲突）
+│   ├── service.py     # 核心业务逻辑（登记 / 变更 / 判定 / 凭证 / 证明包导出 / 幂等冲突）
+│   ├── signing.py     # 本地持久 Ed25519 密钥、密钥轮换与 JWS(EdDSA) 证明包签名/验签
 │   ├── database.py    # SQLite 连接与建表
 │   ├── schemas.py     # 请求/响应模型
 │   ├── seed.py        # 幂等的示例数据
 │   └── config.py      # 环境变量配置
-├── tests/test_api.py  # 端到端测试（pytest + TestClient）
+├── examples/
+│   ├── curl-examples.sh            # HTTP API 全流程调用示例（含证明包/密钥轮换）
+│   └── offline-verify-proof.py     # 离线验签示例（仅依赖 cryptography）
+├── tests/test_api.py    # 端到端 API 测试（pytest + TestClient）
+├── tests/test_signing.py # 签名密钥与证明包编码的单元测试
 ├── docker/entrypoint.sh
 ├── Dockerfile
 ├── docker-compose.yml
@@ -82,8 +88,10 @@ docker compose down -v         # 同时删除数据卷（清空数据）
 | `APP_HOST` | `0.0.0.0` | uvicorn 监听地址，一般无需修改 |
 | `APP_PORT` | `8000` | **宿主机映射端口**（同时作为容器内监听端口）；改为如 `8080` 后访问 <http://localhost:8080> |
 | `DB_PATH` | `/data/licenses.db` | SQLite 数据库文件路径（位于持久化卷内） |
+| `SIGNING_KEYS_DIR` | `<DB 所在目录>/signing-keys`（容器内即 `/data/signing-keys`） | 证明包 Ed25519 签名密钥目录（位于持久化卷内；轮换后旧密钥仍保留以供旧证明包验签） |
 | `INIT_DB` | `true` | 启动时自动建表（`CREATE TABLE IF NOT EXISTS`，幂等） |
 | `SEED_DEMO` | `true` | 数据库为空时写入示例数据；对已有数据的数据库自动跳过。生产环境可设为 `false` |
+| `INIT_SIGNING_KEY` | `true` | 启动时确保存在活跃签名密钥：无密钥则生成首个密钥、仅有旧密钥而缺指针则自动修复；密钥目录不可用时只记录错误（证明包导出返回 503），不影响其他接口 |
 | `CONFIG_ECHO` | `true` | 启动时在日志打印解析后的配置 |
 
 临时改端口或关闭示例数据：
@@ -404,7 +412,145 @@ curl -s -X POST http://localhost:8000/permissions/vouchers \
   -d '{"voucher_id":"approval-2026-03-research-001","version_id":"demo-derived-1","use":"commercial","at":"2026-03-01T00:00:00Z"}'
 ```
 
-### 8. 查询接口
+### 8. 导出用途判定凭证的离线审计证明包（签名固定）
+
+`POST /permissions/vouchers/{voucher_id}/proof` · `GET /permissions/vouchers/{voucher_id}/proof`
+
+研究审批把已签发的用途判定凭证交给**离线审计方**核验时，按凭证标识导出一个自包含的**证明包**：内含首次判定的完整快照、签名算法、密钥标识与签名，以及明确的验签编码规则；包内同时携带签发公钥（SPKI PEM 与 RFC 8037 JWK），审计方完全离线即可验签，也可按下述公钥接口从服务方独立取公钥交叉核对。
+
+```bash
+# 首次导出：201，证明包签名并原子固化
+curl -s -X POST http://localhost:8000/permissions/vouchers/approval-2026-03-research-001/proof
+# 重复/并发导出：200，replayed=true，返回同一份已固化证明包（逐字段一致）
+# 只读取回已固化的证明包（不触发签名、不重签）
+curl -s http://localhost:8000/permissions/vouchers/approval-2026-03-research-001/proof
+```
+
+证明包结构（字段说明见下；完整 JSON 可经 `examples/curl-examples.sh` 查看）：
+
+```json
+{
+  "replayed": false,
+  "proof": {
+    "format_version": 1,
+    "voucher_id": "approval-2026-03-research-001",
+    "payload": {
+      "format_version": 1,
+      "voucher_id": "...",
+      "version_id": "demo-derived-1",
+      "use": "research",
+      "at": "2026-03-01T00:00:00.000000Z",
+      "registered_at": "2026-10-05T01:23:45.123456Z",
+      "allowed": true,
+      "closure": ["demo-derived-1", "demo-root-a", "demo-root-b"],
+      "basis": [ { "version_id": "...", "change_id": "...", "effective_at": "...", "allowed_uses": ["..."] } ],
+      "blockers": [],
+      "allowed_uses_intersection": ["research"]
+    },
+    "signature": {
+      "algorithm": "Ed25519",
+      "jws_alg": "EdDSA",
+      "key_id": "key-20261005t012345z-1a2b3c4d",
+      "protected_header": { "alg": "EdDSA", "kid": "key-..." },
+      "protected": "BASE64URL(UTF8(保护头 JSON))",
+      "payload": "BASE64URL(规范 JSON 载荷)",
+      "signature": "BASE64URL(Ed25519 签名)",
+      "compact_serialization": "<protected>.<payload>.<signature>",
+      "public_key_pem": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n",
+      "public_key_jwk": { "kty": "OKP", "crv": "Ed25519", "x": "...", "kid": "key-..." }
+    },
+    "verification": {
+      "encoding": { "format": "jws-eddsa-ed25519-v1", "...": "明确的验签编码规则（见下）", "covered_fields": ["..."] },
+      "public_key_url": "/signing/keys/key-.../public",
+      "public_keys_url": "/signing/keys"
+    },
+    "exported_at": "2026-10-05T01:24:00.000000Z"
+  }
+}
+```
+
+**签名覆盖范围（篡改任一字段均无法通过验签）**：`format_version`、`voucher_id`、`version_id`、`use`、`at`（判定时刻）、`registered_at`（凭证登记时刻）、`allowed`、`closure`（祖先闭包）、`basis`（依据）、`blockers`（阻断原因）、`allowed_uses_intersection`（用途交集）。其中各列表的**顺序同样参与签名**（祖先顺序、依据顺序、阻断顺序、用途顺序被调换也会验签失败）。`exported_at` 只是首次导出的固化元数据，**不在**签名载荷内，因此轮换密钥后重放旧包不会因时间元数据而需要重签。
+
+**明确的验签编码规则**（与 `verification.encoding` 一致，审计方照此重算即可）：
+
+1. 签名方案：**Ed25519（RFC 8032）**，JWS 紧凑序列化（RFC 7515 §7.1），JWS 头 `alg=EdDSA`（RFC 8037）；
+2. 保护头：UTF-8 JSON `{"alg":"EdDSA","kid":"<key_id>"}`，键按字典序、紧凑分隔符；
+3. 载荷：UTF-8 JSON，**键按字典序排序、紧凑分隔符（`','` 与 `':'`）、非 ASCII 原样输出（`ensure_ascii=false`）**；时间统一为 UTC 文本 `YYYY-MM-DDTHH:MM:SS.ffffffZ`；
+4. Base64URL：RFC 4648 §5，**无填充**；
+5. 签名输入：`ASCII(BASE64URL(保护头 JSON)) + "." + BASE64URL(载荷 JSON 的 UTF-8 字节)`，对其做 Ed25519 签名；
+6. 验签时把包内 `payload` 对象按第 3 条重新编码，必须与 `signature.payload` 解码后的字节**逐字节一致**（任何字段被改动都会在此或在签名校验处失败）。
+
+**原子性、幂等与历史语义**：
+
+- 首次导出在服务进程级锁与单个写事务内「读取不可变凭证快照 → 以活跃密钥签名 → 整体落库」，失败不留半成品；重复或**并发**导出都返回**同一份内容**（恰一个 `201`，其余 `200 replayed=true`，签名唯一）；
+- **已有历史凭证随时可导出**（包括导出前签发、之后许可发生变更/作废的凭证）；导出的是凭证首次判定快照，不受之后数据影响；
+- 证明包与凭证一样是**不可变历史**：任何接口都不会更新或重签它。
+
+| 情形 | 结果 |
+| --- | --- |
+| 首次导出（允许或拒绝凭证均可） | `201`，`replayed=false` |
+| 重复导出 / 并发首次导出 | `200`，`replayed=true`，返回同一证明包 |
+| 凭证不存在（POST 或 GET） | `404 not_found`，不留证明行 |
+| 凭证存在但从未导出（GET） | `404 not_found`，`details.reason=proof_not_exported` |
+| 签名密钥缺失/损坏/密钥目录不可写 | `503 signing_key_unavailable`（明确报错；其他接口不受影响） |
+
+### 9. 签发公钥与本地持久密钥轮换
+
+`GET /signing/keys` · `GET /signing/keys/{key_id}/public` · `POST /signing/keys/rotate`
+
+服务使用**本地持久密钥**：Ed25519 私钥以 PKCS#8 PEM 保存在 `SIGNING_KEYS_DIR`（默认与数据库同在持久卷内，容器内 `/data/signing-keys`），每个密钥一个 `<key_id>.json`（文件权限 `600`、目录 `700`，原子写入），`active` 单行文件指向当前活跃密钥。首次启动若目录为空会自动生成首个密钥（`INIT_SIGNING_KEY=true`）。
+
+```bash
+# 列出全部保留公钥（含轮换前旧公钥）与当前活跃密钥
+curl -s http://localhost:8000/signing/keys
+
+# 按密钥标识取对应公钥（轮换后旧公钥仍可取回）
+curl -s http://localhost:8000/signing/keys/key-20261005t012345z-1a2b3c4d/public
+
+# 轮换：生成并启用新密钥（201），旧密钥文件全部保留
+curl -s -X POST http://localhost:8000/signing/keys/rotate
+# -> { "previous_key_id": "key-...旧", "key": { "key_id": "key-...新", "active": true, "public_key_pem": "...", "public_key_jwk": {...} } }
+```
+
+轮换后的核验语义：
+
+- **旧证明包仍可核验**：它的 `kid` 与签名永不改变，用 `GET /signing/keys/{旧 key_id}/public` 取回的旧公钥即可验签（该公钥标记为 `"active": false`）；**旧包不会被重签**——重复导出始终返回原内容；
+- 轮换**之后**首次导出的证明包由新活跃密钥签名；新旧包互不通用公钥（用错公钥验签必然失败）；
+- 若活跃指针指向的密钥文件丢失、密钥文件损坏或密钥目录不可创建/写入，密钥初始化/轮换/证明包导出都会返回 `503 signing_key_unavailable`（含原因与目录），服务其余功能（登记、签发、查询、实时判定）保持正常。
+
+> 备份时请同时备份数据库与 `SIGNING_KEYS_DIR`；**私钥丢失后历史证明包无法由本服务重新出具**（已分发的证明包仍可用已取得的公钥核验）。轮换端点无内建鉴权，暴露到不可信网络时应放在管理网络/反向代理鉴权之后。
+
+### 10. 离线验签示例（无需服务在线）
+
+`examples/offline-verify-proof.py` 只依赖 `cryptography`（`pip install cryptography`），不导入本服务任何代码，可在审计方离线环境运行，接受**裸证明包**或 `POST` 导出的 `{replayed, proof}` 包装：
+
+```bash
+# 导出并保存（POST 返回 {replayed, proof}）
+curl -s -X POST http://localhost:8000/permissions/vouchers/approval-2026-03-research-001/proof > proof.json
+
+# 1) 完全离线：使用包内自带公钥验签，并打印判定快照关键字段
+python3 examples/offline-verify-proof.py proof.json
+
+# 2) 用独立渠道取得的公钥（SPKI PEM）交叉核验
+KID=$(python3 -c "import json;print(json.load(open('proof.json'))['proof']['signature']['key_id'])")
+curl -s http://localhost:8000/signing/keys/$KID/public \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['public_key_pem'])" > key.pem
+python3 examples/offline-verify-proof.py proof.json --public-key key.pem
+
+# 3) 直接从运行中的服务拉取证明包（审计侧只需出网 HTTP，无需其他依赖）
+python3 examples/offline-verify-proof.py \
+  --server http://localhost:8000 --voucher-id approval-2026-03-research-001
+```
+
+验签通过退出码为 `0`，失败（字段被篡改、公钥不匹配、包格式非法）为非零并给出原因，例如：
+
+```text
+✅ 验签通过（EdDSA/Ed25519，密钥 key-20261005t012345z-1a2b3c4d）
+❌ payload 重编码与已签名 payload 不一致（字段可能被篡改）
+❌ 验签失败：签名与载荷/公钥不匹配（字段可能被篡改）
+```
+
+### 11. 查询接口
 
 | 方法与路径 | 说明 |
 | --- | --- |
@@ -415,6 +561,11 @@ curl -s -X POST http://localhost:8000/permissions/vouchers \
 | `GET /license-changes/revocations/{revocation_id}` | 按作废标识追溯作废回执，不存在返回 `404` |
 | `POST /permissions/vouchers` | 把一次用途判定原子签发为可追溯凭证（首次 `201` / 同输入重试 `200` / 输入冲突 `409`） |
 | `GET /permissions/vouchers/{voucher_id}` | 追溯凭证，恒返回首次保存的判定；不存在返回 `404` |
+| `POST /permissions/vouchers/{voucher_id}/proof` | 按凭证标识导出固定签名证明包（首次 `201` / 重复或并发 `200` / 未知凭证 `404` / 密钥不可用 `503`） |
+| `GET /permissions/vouchers/{voucher_id}/proof` | 取回已固化的证明包（不签名、不重签）；未导出过 `404 proof_not_exported` |
+| `GET /signing/keys` | 列出全部保留的签发公钥（含轮换前旧公钥）与当前活跃密钥标识 |
+| `GET /signing/keys/{key_id}/public` | 按密钥标识取签发公钥（SPKI PEM + JWK），未知标识 `404` |
+| `POST /signing/keys/rotate` | 轮换活跃签名密钥（`201`；旧密钥保留，旧证明包不重签），密钥不可用 `503` |
 
 错误响应统一形如：
 
@@ -444,7 +595,8 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
 # 初始化依赖即数据库建表在应用启动时自动完成（默认 DB_PATH=/data/licenses.db，
-# 本地运行建议指向可写路径）：
+# 本地运行建议指向可写路径；签名密钥默认落在数据库同级的 signing-keys 目录，
+# 可用 SIGNING_KEYS_DIR 单独指定）：
 DB_PATH=./data/licenses.db SEED_DEMO=true uvicorn app.main:app --reload --port 8000
 
 # 运行测试
@@ -452,4 +604,4 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端）。
+测试覆盖：父引用存在性与不可变、祖先展开（含菱形去重）、用途交集、无有效许可阻断、最近变更生效、幂等重放、两类 409 冲突、时区校验、示例数据初始化，变更预演（目标与后代翻转、查询早于生效时刻/更晚变更覆盖不误报、重放无影响、冲突与 404 错误语义、菱形后代只计一次、预演不写入、并发提交下快照不混用），区间分段判定（变更边界切分、起点变更立即生效/终点变更不计入、无有效许可持续拒绝、菱形闭包去重、每段全部阻断版本与原因、与单时刻判定逐点一致、未知版本 404、无时区与倒置/空区间 422），许可变更作废（回执字段与追溯、同标识同内容重试返回原回执、标识复用内容不同/另一标识重复作废两类 409、目标不存在 404、原变更仍可查且带作废标记、单时点与区间判定对所有时刻忽略已作废变更、作废唯一变更后无有效许可阻断、祖先作废阻断后代、重放不能恢复、预演基于作废后快照且不落库、并发同标识重试恰一次创建、示例数据端到端），以及用途判定凭证（允许与拒绝都留痕、凭证内容与实时判定逐字段一致、去空格用途与 UTC 时刻归一化后同输入重试返回原凭证、标识复用到不同输入三类 409、未知凭证/未知版本 404、空用途/无时区 422 且不留凭证、省略标识自动生成、变更收紧与作废后历史凭证不可改写、并发同标识恰一次签发、示例数据端到端），和离线审计证明包与签名密钥（首次导出 201 且包内含完整快照/算法/密钥标识/签名/验签规则、独立公钥（端点 PEM 与包内 PEM）验签通过、重复与并发导出逐字段同一内容且恰一次固化、未知凭证 POST/GET 均 404 且不留行、未导出 GET 为 404 proof_not_exported、历史凭证在许可变更/作废后仍导出首次快照、篡改版本/用途/判定时刻/登记时刻/允许结果/祖先顺序/依据/阻断原因/用途交集/签名字节均验签失败、轮换后旧包不重签且用旧公钥仍可验签、用新公钥交叉验签失败、轮换后新包用新密钥、旧公钥标记非活跃且仍可取回、密钥目录不可用时导出/轮换明确 503 且其他接口照常、密钥文件丢失/损坏/指针缺失的启动自愈与报错、证明包与密钥跨重启持久、规范 JSON 与 base64url 编码确定性、示例数据端到端）。

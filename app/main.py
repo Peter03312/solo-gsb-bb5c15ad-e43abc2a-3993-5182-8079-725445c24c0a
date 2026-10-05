@@ -19,6 +19,7 @@ from .schemas import (
     CreateResponse,
     ErrorDetail,
     ImpactedVersion,
+    KeyRotationResponse,
     LicenseChangeRequest,
     LicenseChangeResponse,
     PermissionResponse,
@@ -28,6 +29,10 @@ from .schemas import (
     PreviewChangeStub,
     PreviewQuery,
     PreviewResponse,
+    ProofExportResponse,
+    ProofPackage,
+    PublicKeyListResponse,
+    PublicKeyResponse,
     RevocationReceipt,
     RevocationResponse,
     VersionCreateRequest,
@@ -37,7 +42,8 @@ from .schemas import (
     VoucherResponse,
 )
 from .seed import seed_demo_data
-from .service import InvalidTimeError, LicenseService, ServiceError
+from .service import InvalidTimeError, LicenseService, NotFoundError, ServiceError
+from .signing import KeyStore, SigningKeyUnavailableError
 
 logger = logging.getLogger("license_service")
 
@@ -56,9 +62,12 @@ def _parse_aware_param(raw: str, name: str) -> datetime:
 
 
 class AppState:
-    def __init__(self, db: Database, service: LicenseService) -> None:
+    def __init__(
+        self, db: Database, service: LicenseService, key_store: KeyStore
+    ) -> None:
         self.db = db
         self.service = service
+        self.key_store = key_store
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -77,16 +86,26 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             logger.info("数据库 schema 已就绪：%s", settings.db_path)
         if settings.seed_demo and settings.init_db:
             seed_demo_data(db)
+        key_store = KeyStore(settings.signing_keys_dir)
+        if settings.init_signing_key:
+            # Missing keys bootstrap a genesis key here; an unwritable directory
+            # does not stop startup — only proof exports fail explicitly (503).
+            try:
+                active = key_store.ensure_active_key()
+                logger.info("签名密钥已就绪：%s（目录 %s）", active.key_id, settings.signing_keys_dir)
+            except SigningKeyUnavailableError as exc:
+                logger.error("签名密钥初始化失败，证明包导出将不可用：%s", exc.message)
         if settings.echo:
             logger.info(
-                "配置 DB_PATH=%s HOST=%s PORT=%s INIT_DB=%s SEED_DEMO=%s",
+                "配置 DB_PATH=%s SIGNING_KEYS_DIR=%s HOST=%s PORT=%s INIT_DB=%s SEED_DEMO=%s",
                 settings.db_path,
+                settings.signing_keys_dir,
                 settings.host,
                 settings.port,
                 settings.init_db,
                 settings.seed_demo,
             )
-        app.state.app_state = AppState(db, LicenseService(db))
+        app.state.app_state = AppState(db, LicenseService(db, key_store), key_store)
         try:
             yield
         finally:
@@ -119,6 +138,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             message="无法解析带时区的 UTC 时刻：" + str(exc),
         )
         return JSONResponse(status_code=422, content=detail.model_dump())
+
+    @app.exception_handler(SigningKeyUnavailableError)
+    async def handle_signing_key_unavailable(
+        _: Request, exc: SigningKeyUnavailableError
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={
+                "error": exc.code,
+                "message": exc.message,
+                "details": exc.details,
+            },
+        )
 
     # -- health & meta ----------------------------------------------------
 
@@ -370,6 +402,96 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     def get_voucher(voucher_id: str, request: Request) -> VoucherDecision:
         return VoucherDecision(**service_from(request).get_voucher(voucher_id))
+
+    # -- signed voucher proof packages (offline audit) --------------------
+
+    @app.post(
+        "/permissions/vouchers/{voucher_id}/proof",
+        response_model=ProofExportResponse,
+        status_code=201,
+        tags=["permissions"],
+        summary="按凭证标识导出固定签名证明包（首次固化，重复/并发返回同一内容）",
+        responses={
+            200: {"description": "重复或并发导出：返回已固化的同一证明包"},
+            201: {"description": "首次导出：证明包已签名并原子固化"},
+            404: {"description": "凭证不存在"},
+            503: {"description": "本地签名密钥不可用（缺失/损坏/目录不可写）"},
+        },
+    )
+    def export_voucher_proof(
+        voucher_id: str, request: Request
+    ) -> JSONResponse | ProofExportResponse:
+        package, replayed = service_from(request).export_voucher_proof(voucher_id)
+        body = ProofExportResponse(replayed=replayed, proof=ProofPackage(**package))
+        if replayed:
+            # 200 distinguishes a repeat/concurrent export from first freezing.
+            return JSONResponse(status_code=200, content=body.model_dump(mode="json"))
+        return body
+
+    @app.get(
+        "/permissions/vouchers/{voucher_id}/proof",
+        response_model=ProofPackage,
+        tags=["permissions"],
+        summary="取回已固化的签名证明包（不触发签名，不重签）",
+        responses={404: {"description": "凭证不存在，或该凭证尚未导出过证明包"}},
+    )
+    def get_voucher_proof(voucher_id: str, request: Request) -> ProofPackage:
+        return ProofPackage(**service_from(request).get_voucher_proof(voucher_id))
+
+    # -- signing keys ------------------------------------------------------
+
+    @app.get(
+        "/signing/keys",
+        response_model=PublicKeyListResponse,
+        tags=["signing"],
+        summary="列出全部保留的签发公钥（含轮换前旧公钥）",
+    )
+    def list_signing_keys(request: Request) -> PublicKeyListResponse:
+        state = request.app.state.app_state
+        keys = state.key_store.list_public_keys()
+        active_id = next(
+            (str(entry["key_id"]) for entry in keys if entry.get("active") is True),
+            state.key_store.active_key_id(),
+        )
+        return PublicKeyListResponse(
+            active_key_id=active_id,
+            keys=[PublicKeyResponse(**entry) for entry in keys],
+        )
+
+    @app.get(
+        "/signing/keys/{key_id}/public",
+        response_model=PublicKeyResponse,
+        tags=["signing"],
+        summary="按密钥标识取回签发公钥（轮换后的旧公钥仍可取回验签）",
+        responses={404: {"description": "密钥标识不存在"}},
+    )
+    def get_signing_public_key(key_id: str, request: Request) -> PublicKeyResponse:
+        state = request.app.state.app_state
+        key = state.key_store.get_public_key(key_id)
+        if key is None:
+            raise NotFoundError("签名公钥不存在", {"key_id": key_id})
+        active_id = state.key_store.active_key_id()
+        return PublicKeyResponse(**key.public_metadata(active=key_id == active_id))
+
+    @app.post(
+        "/signing/keys/rotate",
+        response_model=KeyRotationResponse,
+        status_code=201,
+        tags=["signing"],
+        summary="轮换活跃签名密钥（生成并启用新密钥，旧密钥全部保留可验签）",
+        responses={503: {"description": "密钥目录不可用，或活跃密钥已丢失"}},
+    )
+    def rotate_signing_key(request: Request) -> KeyRotationResponse:
+        state = request.app.state.app_state
+        new_key, previous_id = state.key_store.rotate()
+        logger.info(
+            "签名密钥已轮换：%s -> %s", previous_id or "<none>", new_key.key_id
+        )
+        return KeyRotationResponse(
+            replayed=False,
+            previous_key_id=previous_id,
+            key=PublicKeyResponse(**new_key.public_metadata(active=True)),
+        )
 
     return app
 

@@ -1462,3 +1462,459 @@ def test_timeline_on_demo_seed(tmp_path):
             for entry in research["segments"][2]["basis"]
         }
         assert basis_june["demo-root-a"] == "demo-chg-a-2"
+
+# -- signed voucher proof packages -----------------------------------------
+
+import copy
+import json
+import threading
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.serialization import load_pem_public_key
+
+from app.signing import (
+    SigningKeyUnavailableError,
+    b64url_decode,
+    b64url_encode,
+    canonical_json_bytes,
+    verify_proof_package,
+)
+
+
+def _proof_setup(client, voucher_id="pv-1", use="research", at="2026-05-01T00:00:00Z"):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    resp = _issue_voucher(client, voucher_id, "a", use, at)
+    assert resp.status_code == 201, resp.text
+    return resp.json()["voucher"]
+
+
+def _export_proof(client, voucher_id):
+    return client.post(f"/permissions/vouchers/{voucher_id}/proof")
+
+
+def _verify_independently(pkg, public_pem):
+    sig = pkg["signature"]
+    pub = load_pem_public_key(public_pem.encode("ascii"))
+    signing_input = f"{sig['protected']}.{sig['payload']}".encode("ascii")
+    pub.verify(b64url_decode(sig["signature"]), signing_input)
+
+
+def _retamper(pkg, mutate):
+    tampered = copy.deepcopy(pkg)
+    mutate(tampered["payload"])
+    tampered["signature"]["payload"] = b64url_encode(
+        canonical_json_bytes(tampered["payload"])
+    )
+    return tampered
+
+
+def test_proof_first_export_returns_201_and_is_verifiable(client):
+    voucher = _proof_setup(client)
+    resp = _export_proof(client, "pv-1")
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["replayed"] is False
+    pkg = body["proof"]
+
+    assert pkg["voucher_id"] == "pv-1"
+    assert pkg["format_version"] >= 1
+    payload = pkg["payload"]
+    # The signed payload is the complete first-decision snapshot ...
+    for field in (
+        "format_version",
+        "voucher_id",
+        "version_id",
+        "use",
+        "at",
+        "registered_at",
+        "allowed",
+        "closure",
+        "basis",
+        "blockers",
+        "allowed_uses_intersection",
+    ):
+        assert field in payload
+    assert payload["voucher_id"] == "pv-1"
+    assert payload["version_id"] == "a"
+    assert payload["use"] == "research"
+    assert payload["at"] == "2026-05-01T00:00:00.000000Z"
+    assert payload["registered_at"] == voucher["registered_at"].replace(
+        "+00:00", "Z"
+    )
+    assert payload["allowed"] is True
+    assert payload["closure"] == ["a"]
+    assert payload["basis"][0]["change_id"] == "ca"
+    assert payload["allowed_uses_intersection"] == ["research", "review"]
+
+    sig = pkg["signature"]
+    assert sig["algorithm"] == "Ed25519"
+    assert sig["jws_alg"] == "EdDSA"
+    assert sig["key_id"]
+    # Protected header is canonical {"alg": "EdDSA", "kid": key_id}.
+    assert json.loads(b64url_decode(sig["protected"])) == {
+        "alg": "EdDSA",
+        "kid": sig["key_id"],
+    }
+    # The payload segment is the canonical encoding of the carried payload.
+    assert b64url_decode(sig["payload"]) == canonical_json_bytes(payload)
+    assert sig["compact_serialization"] == ".".join(
+        [sig["protected"], sig["payload"], sig["signature"]]
+    )
+
+    # Public key fetchable by id (PEM) and carried inside the package; both
+    # verify the signature.
+    pub_resp = client.get(f"/signing/keys/{sig['key_id']}/public")
+    assert pub_resp.status_code == 200
+    pub_json = pub_resp.json()
+    assert pub_json["active"] is True
+    assert pub_json["public_key_jwk"]["kty"] == "OKP"
+    assert pub_json["public_key_jwk"]["crv"] == "Ed25519"
+    _verify_independently(pkg, pub_json["public_key_pem"])
+    _verify_independently(pkg, sig["public_key_pem"])
+
+    # The bundled self-check helper agrees.
+    ok, message = verify_proof_package(pkg)
+    assert ok, message
+
+    # Encoding rules are explicit and enumerate every covered field.
+    rules = pkg["verification"]["encoding"]
+    assert rules["format"] == "jws-eddsa-ed25519-v1"
+    assert set(rules["covered_fields"]) == {
+        "allowed",
+        "allowed_uses_intersection",
+        "at",
+        "basis",
+        "blockers",
+        "closure",
+        "format_version",
+        "registered_at",
+        "use",
+        "version_id",
+        "voucher_id",
+    }
+    # The public key URL is the concrete path for this package's key id.
+    assert (
+        pkg["verification"]["public_key_url"]
+        == f"/signing/keys/{sig['key_id']}/public"
+    )
+    assert pkg["verification"]["public_keys_url"] == "/signing/keys"
+
+
+def test_proof_denied_voucher_carries_blockers_and_verifies(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "pv-deny", "a", "review", "2026-05-01T00:00:00Z")
+    pkg = _export_proof(client, "pv-deny").json()["proof"]
+    payload = pkg["payload"]
+    assert payload["allowed"] is False
+    assert payload["blockers"] == [
+        {
+            "version_id": "a",
+            "reason": "use_not_allowed",
+            "change_id": "ca",
+            "effective_at": "2026-01-01T00:00:00.000000Z",
+            "allowed_uses": ["research"],
+        }
+    ]
+    ok, message = verify_proof_package(pkg)
+    assert ok, message
+
+
+def test_proof_repeat_export_returns_same_fixed_package(client):
+    _proof_setup(client)
+    first = _export_proof(client, "pv-1")
+    assert first.status_code == 201
+    first_pkg = first.json()["proof"]
+
+    second = _export_proof(client, "pv-1")
+    assert second.status_code == 200
+    assert second.json()["replayed"] is True
+    assert second.json()["proof"] == first_pkg
+
+    # GET returns the same frozen package without signing anything.
+    fetched = client.get("/permissions/vouchers/pv-1/proof")
+    assert fetched.status_code == 200
+    assert fetched.json() == first_pkg
+
+
+def test_proof_concurrent_exports_freeze_exactly_one(client):
+    _proof_setup(client)
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    outcomes: list[tuple[bool, str]] = []
+    lock = threading.Lock()
+
+    def worker() -> None:
+        try:
+            package, replayed = service.export_voucher_proof("pv-1")
+            with lock:
+                outcomes.append((replayed, package["signature"]["signature"]))
+        except Exception as exc:  # noqa: BLE001
+            with lock:
+                outcomes.append(("error", type(exc).__name__))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert all(replayed != "error" for replayed, _ in outcomes), outcomes
+    assert sum(1 for replayed, _ in outcomes if replayed is False) == 1
+    signatures = {sig for _, sig in outcomes}
+    assert signatures == {outcomes[0][1]}  # one signature => same package
+    # One row in storage.
+    import sqlite3
+
+    conn = sqlite3.connect(service.db.path)
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM voucher_proofs WHERE voucher_id = 'pv-1'"
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_proof_unknown_voucher_is_404_and_creates_nothing(client):
+    resp = _export_proof(client, "ghost")
+    assert resp.status_code == 404
+    assert resp.json()["error"] == "not_found"
+    assert client.get("/permissions/vouchers/ghost/proof").status_code == 404
+    import sqlite3
+
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+    conn = sqlite3.connect(service.db.path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM voucher_proofs").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+def test_proof_get_before_export_is_404(client):
+    _proof_setup(client)
+    resp = client.get("/permissions/vouchers/pv-1/proof")
+    assert resp.status_code == 404
+    assert resp.json()["details"].get("reason") == "proof_not_exported"
+
+
+def test_proof_historical_voucher_exportable_after_state_changes(client):
+    _register(client, "a")
+    _change(client, "ca", "a", _iso(2026, 1, 1), ["research", "review"])
+    _issue_voucher(client, "pv-old", "a", "review", "2026-05-01T00:00:00Z")
+    # Change the world: revoke the basis change and issue a later voucher.
+    rev = client.post(
+        "/license-changes/revocations",
+        json={
+            "change_id": "ca",
+            "revocation_id": "rev-ca",
+            "reason": "x",
+        },
+    )
+    assert rev.status_code == 201
+    _issue_voucher(client, "pv-new", "a", "research", "2026-09-01T00:00:00Z")
+
+    # The pre-existing (historical) voucher still exports its first snapshot.
+    pkg = _export_proof(client, "pv-old").json()["proof"]
+    assert pkg["payload"]["allowed"] is True
+    assert pkg["payload"]["basis"][0]["change_id"] == "ca"
+    ok, message = verify_proof_package(pkg)
+    assert ok, message
+    # And the newer historical voucher exports too.
+    pkg2 = _export_proof(client, "pv-new").json()["proof"]
+    assert pkg2["payload"]["allowed"] is False
+    assert pkg2["payload"]["blockers"][0]["reason"] == "no_valid_license"
+    ok2, message2 = verify_proof_package(pkg2)
+    assert ok2, message2
+    # Different signatures (different snapshots, same key is fine).
+    assert pkg["signature"]["signature"] != pkg2["signature"]["signature"]
+
+
+def test_proof_tampering_any_covered_field_fails_verification(client):
+    _proof_setup(client)
+    pkg = _export_proof(client, "pv-1").json()["proof"]
+    pub_pem = pkg["signature"]["public_key_pem"]
+
+    def rejected(tampered):
+        sig = tampered["signature"]
+        try:
+            _verify_independently(tampered, pub_pem)
+        except InvalidSignature:
+            return True
+        return False
+
+    scalar_mutations = {
+        "version_id": lambda p: p.__setitem__("version_id", "a-evil"),
+        "use": lambda p: p.__setitem__("use", "review"),
+        "at": lambda p: p.__setitem__("at", "2026-05-02T00:00:00.000000Z"),
+        "registered_at": lambda p: p.__setitem__(
+            "registered_at", "2026-01-01T00:00:00.000000Z"
+        ),
+        "allowed": lambda p: p.__setitem__("allowed", not p["allowed"]),
+        "closure_add": lambda p: p["closure"].append("ghost-ancestor"),
+        "intersection": lambda p: p.__setitem__(
+            "allowed_uses_intersection", ["research", "commercial"]
+        ),
+        "basis_use": lambda p: p["basis"][0]["allowed_uses"].append("commercial"),
+    }
+    for name, mutate in scalar_mutations.items():
+        assert rejected(_retamper(pkg, mutate)), name
+
+    # Reordering a multi-ancestor closure also invalidates the signature.
+    _register(client, "p1")
+    _register(client, "p2")
+    _register(client, "multi", ["p1", "p2"])
+    _change(client, "cp1", "p1", _iso(2026, 1, 1), ["research"])
+    _change(client, "cp2", "p2", _iso(2026, 1, 1), ["research"])
+    _change(client, "cm", "multi", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "pv-multi", "multi", "research", "2026-05-01T00:00:00Z")
+    multi_pkg = _export_proof(client, "pv-multi").json()["proof"]
+    assert len(multi_pkg["payload"]["closure"]) >= 2
+    assert rejected(_retamper(multi_pkg, lambda p: p["closure"].reverse()))
+
+    # Blockers on a denied voucher.
+    _register(client, "b")
+    _change(client, "cb", "b", _iso(2026, 1, 1), ["research"])
+    _issue_voucher(client, "pv-2", "b", "commercial", "2026-05-01T00:00:00Z")
+    denied = _export_proof(client, "pv-2").json()["proof"]
+    assert denied["payload"]["blockers"]
+    assert rejected(
+        _retamper(denied, lambda p: p["blockers"][0].__setitem__(
+            "reason", "no_valid_license"))
+    )
+
+    # Flipping signature bytes directly fails too.
+    flipped = copy.deepcopy(pkg)
+    raw = bytearray(b64url_decode(flipped["signature"]["signature"]))
+    raw[0] ^= 0xFF
+    flipped["signature"]["signature"] = b64url_encode(bytes(raw))
+    assert rejected(flipped)
+
+    # The self-check helper reports the tamper reason.
+    tampered = _retamper(pkg, lambda p: p.__setitem__("use", "review"))
+    ok, message = verify_proof_package(tampered)
+    assert ok is False
+    assert "验签失败" in message
+
+
+def test_proof_rotation_keeps_old_package_verifiable_and_not_resigned(client):
+    _proof_setup(client)
+    old_pkg = _export_proof(client, "pv-1").json()["proof"]
+    old_kid = old_pkg["signature"]["key_id"]
+    old_pem = client.get(f"/signing/keys/{old_kid}/public").json()["public_key_pem"]
+
+    rotated = client.post("/signing/keys/rotate")
+    assert rotated.status_code == 201
+    rotation = rotated.json()
+    new_kid = rotation["key"]["key_id"]
+    assert rotation["previous_key_id"] == old_kid
+    assert new_kid != old_kid
+    assert rotation["key"]["active"] is True
+
+    # The old package is byte-identical, still signed by the old key, and still
+    # verifies with the old public key after rotation.
+    again = _export_proof(client, "pv-1")
+    assert again.status_code == 200
+    assert again.json()["proof"] == old_pkg
+    assert again.json()["proof"]["signature"]["key_id"] == old_kid
+    _verify_independently(old_pkg, old_pem)
+
+    # The old public key is still fetchable (now inactive); the list has both.
+    old_pub = client.get(f"/signing/keys/{old_kid}/public")
+    assert old_pub.status_code == 200
+    assert old_pub.json()["active"] is False
+    listed = client.get("/signing/keys").json()
+    ids = {k["key_id"]: k["active"] for k in listed["keys"]}
+    assert ids == {old_kid: False, new_kid: True}
+    assert listed["active_key_id"] == new_kid
+
+    # A brand-new export is signed with the new key and verifies with it.
+    _issue_voucher(client, "pv-rot", "a", "research", "2026-08-01T00:00:00Z")
+    new_pkg = _export_proof(client, "pv-rot").json()["proof"]
+    assert new_pkg["signature"]["key_id"] == new_kid
+    new_pem = client.get(f"/signing/keys/{new_kid}/public").json()["public_key_pem"]
+    _verify_independently(new_pkg, new_pem)
+    # Cross verification fails: old package under new key, new under old key.
+    for pkg, pem in ((old_pkg, new_pem), (new_pkg, old_pem)):
+        try:
+            _verify_independently(pkg, pem)
+            raise AssertionError("cross-key verification unexpectedly passed")
+        except InvalidSignature:
+            pass
+
+
+def test_proof_signing_key_unavailable_returns_503(client):
+    _proof_setup(client)
+    service = client.app.state.app_state.service  # type: ignore[attr-defined]
+
+    def boom():
+        raise SigningKeyUnavailableError("模拟：签名密钥目录不可写")
+
+    service.key_store.ensure_active_key = boom  # type: ignore[method-assign]
+    resp = _export_proof(client, "pv-1")
+    assert resp.status_code == 503
+    assert resp.json()["error"] == "signing_key_unavailable"
+    # Nothing was frozen; once the key is restored, export works normally.
+    from app.signing import KeyStore
+
+    service.key_store = KeyStore(service.key_store.keys_dir)
+    ok_resp = _export_proof(client, "pv-1")
+    assert ok_resp.status_code == 201
+
+
+def test_proof_persists_across_restart(tmp_path):
+    db_path = str(tmp_path / "restart.db")
+    keys_dir = str(tmp_path / "keys")
+    settings = Settings(
+        db_path=db_path,
+        signing_keys_dir=keys_dir,
+        init_db=True,
+        seed_demo=False,
+        echo=False,
+    )
+    with TestClient(create_app(settings)) as first:
+        _register(first, "a")
+        _change(first, "ca", "a", _iso(2026, 1, 1), ["research"])
+        _issue_voucher(first, "pv-1", "a", "research", "2026-05-01T00:00:00Z")
+        pkg = _export_proof(first, "pv-1").json()["proof"]
+        kid = pkg["signature"]["key_id"]
+
+    # Restart with the same persistent DB and key directory: no re-signing,
+    # same package; rotating afterwards preserves the old key on disk.
+    with TestClient(create_app(settings)) as second:
+        fetched = second.get("/permissions/vouchers/pv-1/proof")
+        assert fetched.status_code == 200
+        assert fetched.json() == pkg
+        repeat = _export_proof(second, "pv-1")
+        assert repeat.status_code == 200
+        assert repeat.json()["proof"] == pkg
+        assert second.get(f"/signing/keys/{kid}/public").status_code == 200
+
+
+def test_proof_on_demo_seed(tmp_path):
+    db_path = str(tmp_path / "seed-proof.db")
+    settings = Settings(db_path=db_path, init_db=True, seed_demo=True, echo=False)
+    with TestClient(create_app(settings)) as test_client:
+        issue = test_client.post(
+            "/permissions/vouchers",
+            json={
+                "voucher_id": "demo-proof-1",
+                "version_id": "demo-derived-1",
+                "use": "review",
+                "at": "2026-03-01T00:00:00Z",
+            },
+        )
+        assert issue.status_code == 201
+        pkg = test_client.post(
+            "/permissions/vouchers/demo-proof-1/proof"
+        ).json()["proof"]
+        assert pkg["payload"]["allowed"] is False
+        assert pkg["payload"]["closure"] == [
+            "demo-derived-1",
+            "demo-root-a",
+            "demo-root-b",
+        ]
+        assert {b["version_id"] for b in pkg["payload"]["blockers"]} == {
+            "demo-root-b"
+        }
+        ok, message = verify_proof_package(pkg)
+        assert ok, message

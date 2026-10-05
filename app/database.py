@@ -76,6 +76,21 @@ SCHEMA_STATEMENTS = [
         decision_json  TEXT NOT NULL
     )
     """,
+    # A proof package freezes a signed export of a voucher. The whole package
+    # (signed payload + signature + verification rules) is stored verbatim so
+    # repeat and concurrent exports return byte-identical content; rows are
+    # immutable history — no API ever updates or re-signs them, even after key
+    # rotation. The key_id/algorithm columns make the binding explicit, but the
+    # authoritative signature lives in proof_json.
+    """
+    CREATE TABLE IF NOT EXISTS voucher_proofs (
+        voucher_id      TEXT PRIMARY KEY REFERENCES permission_vouchers(voucher_id),
+        key_id          TEXT NOT NULL,
+        algorithm       TEXT NOT NULL,
+        exported_at     TEXT NOT NULL,
+        proof_json      TEXT NOT NULL
+    )
+    """,
     "CREATE INDEX IF NOT EXISTS idx_changes_version_time "
     "ON license_changes(version_id, effective_at)",
     "CREATE INDEX IF NOT EXISTS idx_parents_version ON version_parents(version_id)",
@@ -333,4 +348,27 @@ class Database:
                 1 if allowed else 0,
                 decision_json,
             ),
+        )
+
+    # -- voucher proof packages -------------------------------------------
+
+    def get_proof(self, voucher_id: str) -> dict[str, Any] | None:
+        return self.query_one(
+            "SELECT * FROM voucher_proofs WHERE voucher_id = ?",
+            (voucher_id,),
+        )
+
+    def insert_proof(
+        self,
+        voucher_id: str,
+        key_id: str,
+        algorithm: str,
+        exported_at: str,
+        proof_json: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO voucher_proofs "
+            "(voucher_id, key_id, algorithm, exported_at, proof_json) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (voucher_id, key_id, algorithm, exported_at, proof_json),
         )

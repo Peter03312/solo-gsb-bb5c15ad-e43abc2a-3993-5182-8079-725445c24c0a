@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from typing import Any, NamedTuple
 
 from .database import Database
+from .signing import (
+    FORMAT_VERSION,
+    SIGNING_ALGORITHM,
+    KeyStore,
+    SigningKeyUnavailableError,
+    build_signed_proof,
+)
 
 # Canonical UTC timestamp used for storage and lexicographic comparison in SQL.
 # Example: 2026-03-01T08:30:00.000000Z
@@ -168,6 +175,47 @@ def _thaw_decision(blob: str) -> dict[str, Any]:
     }
 
 
+def _proof_payload(voucher_row: dict[str, Any]) -> dict[str, Any]:
+    """Build the signed payload for a voucher proof.
+
+    The payload is sourced from the immutable stored snapshot
+    (``decision_json``): every timestamp is already canonical UTC text and
+    every list keeps its first-decision order, so the payload — and hence the
+    signature — is identical whenever the same voucher is exported.
+    """
+    decision = json.loads(voucher_row["decision_json"])
+    return {
+        "format_version": FORMAT_VERSION,
+        "voucher_id": voucher_row["voucher_id"],
+        "version_id": voucher_row["version_id"],
+        "use": voucher_row["use_name"],
+        "at": voucher_row["at_value"],
+        "registered_at": voucher_row["registered_at"],
+        "allowed": bool(decision["allowed"]),
+        "closure": list(decision["closure"]),
+        "basis": [
+            {
+                "version_id": entry["version_id"],
+                "change_id": entry["change_id"],
+                "effective_at": entry["effective_at"],
+                "allowed_uses": list(entry["allowed_uses"]),
+            }
+            for entry in decision["basis"]
+        ],
+        "blockers": [
+            {
+                "version_id": entry["version_id"],
+                "reason": entry["reason"],
+                "change_id": entry.get("change_id"),
+                "effective_at": entry.get("effective_at"),
+                "allowed_uses": list(entry.get("allowed_uses", ())),
+            }
+            for entry in decision["blockers"]
+        ],
+        "allowed_uses_intersection": list(decision["allowed_uses_intersection"]),
+    }
+
+
 def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
     changes = []
     for change in db.list_changes(row["version_id"]):
@@ -186,8 +234,9 @@ def _version_out(db: Database, row: dict[str, Any]) -> dict[str, Any]:
 
 
 class LicenseService:
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, key_store: KeyStore | None = None) -> None:
         self.db = db
+        self.key_store = key_store
 
     # -- versions ---------------------------------------------------------
 
@@ -729,6 +778,81 @@ class LicenseService:
         if row is None:
             raise NotFoundError("判定凭证不存在", {"voucher_id": voucher_id})
         return self._voucher_out(row)
+
+    # -- signed proof export (offline audit) ------------------------------
+
+    def export_voucher_proof(self, voucher_id: str) -> tuple[dict[str, Any], bool]:
+        """Return the fixed signed proof package for ``voucher_id``.
+
+        The first export reads the immutable voucher row, signs its complete
+        first-decision snapshot with the active local key and freezes the whole
+        package in one write transaction. Repeat and concurrent exports return
+        the same stored package (``replayed=true``); stored packages are never
+        re-signed, including after key rotation. Historical vouchers are
+        exportable exactly like new ones; an unknown voucher is ``404`` and an
+        unusable signing key raises a signing-key error (HTTP 503).
+        """
+        if self.key_store is None:
+            raise SigningKeyUnavailableError("签名密钥未配置")
+
+        with self.db.lock:
+            existing = self.db.get_proof(voucher_id)
+            if existing is not None:
+                return json.loads(existing["proof_json"]), True
+
+            voucher_row = self.db.get_voucher(voucher_id)
+            if voucher_row is None:
+                raise NotFoundError(
+                    "判定凭证不存在，无法导出证明包", {"voucher_id": voucher_id}
+                )
+
+            # Signing material is obtained before opening the write transaction
+            # so a missing/unwritable key never leaves a half-open transaction.
+            key = self.key_store.ensure_active_key()
+            payload = _proof_payload(voucher_row)
+            package = build_signed_proof(
+                payload,
+                key,
+                public_key_url="/signing/keys/{key_id}/public",
+                public_keys_url="/signing/keys",
+            )
+            package["exported_at"] = to_canonical(now_utc())
+            proof_json = json.dumps(package, ensure_ascii=False, sort_keys=True)
+
+            try:
+                self.db.begin()
+                self.db.insert_proof(
+                    voucher_id=voucher_id,
+                    key_id=key.key_id,
+                    algorithm=SIGNING_ALGORITHM,
+                    exported_at=package["exported_at"],
+                    proof_json=proof_json,
+                )
+                self.db.commit()
+            except Exception:
+                self.db.rollback()
+                # A concurrent export may have won the primary key: it carries
+                # the identical voucher snapshot semantics — return that one
+                # package instead of failing, so concurrent calls agree.
+                raced = self.db.get_proof(voucher_id)
+                if raced is not None:
+                    return json.loads(raced["proof_json"]), True
+                raise
+            return package, False
+
+    def get_voucher_proof(self, voucher_id: str) -> dict[str, Any]:
+        """Return an already-frozen proof package without creating one."""
+        row = self.db.get_proof(voucher_id)
+        if row is not None:
+            return json.loads(row["proof_json"])
+        if self.db.get_voucher(voucher_id) is None:
+            raise NotFoundError(
+                "判定凭证不存在，无法导出证明包", {"voucher_id": voucher_id}
+            )
+        raise NotFoundError(
+            "该凭证尚未导出过证明包",
+            {"voucher_id": voucher_id, "reason": "proof_not_exported"},
+        )
 
     @staticmethod
     def _voucher_out(row: dict[str, Any]) -> dict[str, Any]:

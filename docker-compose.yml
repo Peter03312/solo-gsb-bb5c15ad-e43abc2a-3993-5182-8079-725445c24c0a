@@ -10,8 +10,11 @@ services:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
       DB_PATH: "/data/licenses.db"
+      # 证明包签名密钥目录（与数据库同在持久卷内；轮换后旧密钥保留可验签）
+      SIGNING_KEYS_DIR: "/data/signing-keys"
       INIT_DB: "${INIT_DB:-true}"
       SEED_DEMO: "${SEED_DEMO:-true}"
+      INIT_SIGNING_KEY: "${INIT_SIGNING_KEY:-true}"
     volumes:
       - license-data:/data
     restart: unless-stopped
